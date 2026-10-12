@@ -291,9 +291,14 @@ platforms** G4, G9, G17; **performance** G16; **ecosystem** G11; **measurement**
 
 ## G19. Speech to text off in release builds
 
-- **Missing:** the `whisper` feature is off by default and in releases, so Transcribe Sequence,
-  text-based editing and auto captions need a source build.
-- **Estimate:** 5–10 h (model download UX, licence check).
+- **Have:** the release packages (Linux, macOS, Windows, FreeBSD) build with the `whisper` and
+  `speech-download` features, so Transcribe works out of the box. The Text panel offers the
+  speech-model picker and its one-time download itself (size, source and licence shown first),
+  as a background job with progress and Cancel (`transcript.downloadModel`); a missing model
+  reports how to fetch it instead of a bare error.
+- **Still missing:** transcription itself runs synchronously inside the command (no background
+  job or progress bar yet); source-clip transcripts and inline editing.
+- **Estimate:** 5–10 h left (background transcription job, source-clip view).
 
 ## G20. The web app shell
 
@@ -305,4 +310,5 @@ platforms** G4, G9, G17; **performance** G16; **ecosystem** G11; **measurement**
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-11 | minor | G19 shrunk: `whisper` + `speech-download` on in release packages, model picker + download job in the Text panel |
 | 2026-10-10 | major | Created from ROADMAP.md's "Where we are lacking" (2026-10-05); re-ranked against Premiere 26.5.2 and the 188 open issues; added `.prproj`, 10-bit / 4:2:2 camera decode, launch crashes and missing PR CI, localization, delivery formats |

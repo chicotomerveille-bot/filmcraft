@@ -3,7 +3,12 @@
 //! merge, delete), track choice and the track style. Every edit dispatches a `captions.*` engine
 //! command; every widget registers an automation id (`text.*`). The Transcript tab shows the
 //! sequence transcript as speaker paragraphs of clickable words (click, Shift+click to extend);
-//! the selection marks In/Out and can be extracted or lifted (`transcript.*` commands).
+//! the selection marks In/Out and can be extracted or lifted (`transcript.*` commands). Without a
+//! transcript it offers Transcribe and, when the speech model is missing, its one-time download
+//! (size, source and licence shown first, as a background job with Cancel).
+
+use std::sync::PoisonError;
+use std::sync::atomic::Ordering;
 
 use egui::{Align2, Color32, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use filmcraft_project::{CaptionAlign, CaptionAnchor, CaptionFormat};
@@ -308,23 +313,7 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let content = app.transcript_cache.content(&app.session);
     let words = &content.words;
     if words.is_empty() {
-        let c = rect.center();
-        icons::paint(ui.painter(), Rect::from_center_size(c - vec2(0.0, 70.0), vec2(40.0, 40.0)), Icon::Captions, t.text_dim);
-        ui.painter().text(c - vec2(0.0, 30.0), Align2::CENTER_CENTER, tl!("Transcribe sequence"), Tokens::semibold(16.0), t.text);
-        let note = if filmcraft_speech_available(app) {
-            tl!("Speech-to-text turns the dialogue into editable text.")
-        } else {
-            tl!("This build has no speech-to-text; import a transcript with transcript.set.")
-        };
-        ui.painter().text(c - vec2(0.0, 8.0), Align2::CENTER_CENTER, note, Tokens::ui(12.0), t.text_dim);
-        let r = Rect::from_center_size(c + vec2(0.0, 26.0), vec2(200.0, 26.0));
-        let resp = ui.interact(r, egui::Id::new("text.transcript.generate"), Sense::click());
-        ui.painter().rect_filled(r, 13.0, if resp.hovered() { t.accent_hover } else { t.accent });
-        ui.painter().text(r.center(), Align2::CENTER_CENTER, tl!("Transcribe"), Tokens::semibold(12.0), Color32::WHITE);
-        app.auto.add("text.transcript.generate", r, "Transcribe");
-        if resp.clicked() {
-            actions.push(("transcript.generate".into(), json!({})));
-        }
+        transcript_empty(app, ui, rect, &mut actions);
         run(app, ui, actions);
         return;
     }
@@ -405,6 +394,186 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         }
     });
     run(app, ui, actions);
+}
+
+/// The Transcript tab without a transcript: Transcribe, plus the speech-model picker and its
+/// one-time download (size, source and licence shown before downloading, as a background job
+/// with progress and Cancel, like the natural-voice download in Text to Speech).
+/// Automation ids: `text.transcript.generate`, `text.transcript.model`, `text.transcript.model.<id>`,
+/// `text.transcript.download`, `text.transcript.download.confirm`, `text.transcript.download.cancel`.
+fn transcript_empty(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, actions: &mut Vec<(String, Value)>) {
+    let t = app.tokens;
+    let c = rect.center();
+    icons::paint(ui.painter(), Rect::from_center_size(c - vec2(0.0, 70.0), vec2(40.0, 40.0)), Icon::Captions, t.text_dim);
+    ui.painter().text(c - vec2(0.0, 30.0), Align2::CENTER_CENTER, tl!("Transcribe sequence"), Tokens::semibold(16.0), t.text);
+    // a finished download lands in the status line even if it finished while drawing
+    poll_download(app);
+    if !filmcraft_speech_available(app) {
+        ui.painter().text(
+            c - vec2(0.0, 8.0),
+            Align2::CENTER_CENTER,
+            tl!("This build has no speech-to-text; import a transcript with transcript.set."),
+            Tokens::ui(12.0),
+            t.text_dim,
+        );
+        // the button stays (clicking it reports why it is disabled), as agents expect it
+        transcribe_button(app, ui, c, "", actions);
+        return;
+    }
+    ui.painter().text(c - vec2(0.0, 8.0), Align2::CENTER_CENTER, tl!("Speech-to-text turns the dialogue into editable text."), Tokens::ui(12.0), t.text_dim);
+    let models = app.session.execute("transcript.models", json!({})).unwrap_or(Value::Null);
+    let list = models["models"].as_array().cloned().unwrap_or_default();
+    if list.is_empty() {
+        transcribe_button(app, ui, c, "", actions);
+        return;
+    }
+    let default_id = models["default"].as_str().unwrap_or_default().to_string();
+    // hostile UI state (an unknown id through `ui.set`) falls back to the default model
+    let mut picked = app.ui.transcript_model.clone();
+    if !list.iter().any(|m| m["id"].as_str() == Some(picked.as_str())) {
+        picked = default_id;
+    }
+    let picked_model = list.iter().find(|m| m["id"].as_str() == Some(picked.as_str())).cloned().unwrap_or(Value::Null);
+    let picked_name = picked_model["name"].as_str().unwrap_or(&picked).to_string();
+
+    // ---- model picker
+    let w = (rect.width() - 60.0).clamp(120.0, 280.0);
+    let combo_rect = Rect::from_min_size(pos2(c.x - w / 2.0, c.y + 14.0), vec2(w, 24.0));
+    {
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(combo_rect).id_salt("transcript-model"));
+        let cb = egui::ComboBox::from_id_salt("transcript-model-combo").selected_text(&picked_name).width(w).show_ui(&mut child, |ui| {
+            for m in &list {
+                let id = m["id"].as_str().unwrap_or_default();
+                let name = m["name"].as_str().unwrap_or(id);
+                let r = ui.selectable_label(picked == id, name);
+                app.auto.add(&format!("text.transcript.model.{id}"), r.rect, name);
+                if r.clicked() {
+                    app.ui.transcript_model = id.to_string();
+                    app.ui.transcript_confirm_download = false;
+                }
+            }
+        });
+        app.auto.add("text.transcript.model", cb.response.rect, "Speech model");
+    }
+
+    let mb = picked_model["size"].as_u64().map(|b| b as f64 / 1e6).unwrap_or(0.0);
+    let installed = picked_model["installed"].as_bool().unwrap_or(false);
+    if let Some(job_id) = app.ui.transcript_download_job {
+        download_progress(app, ui, rect, c, w, job_id);
+    } else if app.ui.transcript_confirm_download && !installed {
+        let licence = picked_model["license"].as_str().unwrap_or_default();
+        let source = picked_model["source"].as_str().unwrap_or_default();
+        {
+            let mut child = ui.new_child(
+                egui::UiBuilder::new().max_rect(Rect::from_min_size(pos2(c.x - w / 2.0, c.y + 44.0), vec2(w, 64.0))).id_salt("transcript-download-confirm"),
+            );
+            child.label(egui::RichText::new(format!("Download {picked_name}? {mb:.0} MB, once.")).color(t.text).size(12.0).strong());
+            if !licence.is_empty() || !source.is_empty() {
+                child.label(egui::RichText::new(format!("From {source}. Licence: {licence}.")).color(t.text_dim).size(11.0));
+                child.label(egui::RichText::new("Every file is checked against a pinned SHA-256.").color(t.text_dim).size(11.0));
+            }
+        }
+        let dl = Rect::from_min_size(pos2(c.x - 104.0, c.y + 112.0), vec2(100.0, 26.0));
+        let resp = ui.interact(dl, egui::Id::new("text.transcript.download.confirm"), Sense::click());
+        ui.painter().rect_filled(dl, 13.0, if resp.hovered() { t.accent_hover } else { t.accent });
+        ui.painter().text(dl.center(), Align2::CENTER_CENTER, "Download", Tokens::semibold(12.0), Color32::WHITE);
+        app.auto.add("text.transcript.download.confirm", dl, "Download");
+        if resp.clicked() {
+            download_model(app, &picked);
+        }
+        let no = Rect::from_min_size(pos2(c.x + 4.0, c.y + 112.0), vec2(100.0, 26.0));
+        let resp = ui.interact(no, egui::Id::new("text.transcript.download.cancel"), Sense::click());
+        ui.painter().rect_filled(no, 13.0, if resp.hovered() { t.hover } else { t.field_bg });
+        ui.painter().text(no.center(), Align2::CENTER_CENTER, "Cancel", Tokens::semibold(12.0), t.text);
+        app.auto.add("text.transcript.download.cancel", no, "Cancel download");
+        if resp.clicked() {
+            app.ui.transcript_confirm_download = false;
+        }
+    } else if installed {
+        transcribe_button(app, ui, c, &picked, actions);
+    } else {
+        let r = Rect::from_center_size(c + vec2(0.0, 92.0), vec2(220.0, 26.0));
+        let resp = ui.interact(r, egui::Id::new("text.transcript.download"), Sense::click());
+        ui.painter().rect_filled(r, 13.0, if resp.hovered() { t.accent_hover } else { t.accent });
+        ui.painter().text(r.center(), Align2::CENTER_CENTER, format!("Download model ({mb:.0} MB)…"), Tokens::semibold(12.0), Color32::WHITE);
+        app.auto.add("text.transcript.download", r, "Download model");
+        if resp.clicked() {
+            app.ui.transcript_confirm_download = true;
+        }
+    }
+}
+
+/// The Transcribe button of the empty Transcript tab (`model`: "" transcribes with the default).
+fn transcribe_button(app: &mut FilmcraftApp, ui: &mut egui::Ui, c: egui::Pos2, model: &str, actions: &mut Vec<(String, Value)>) {
+    let t = app.tokens;
+    let r = Rect::from_center_size(c + vec2(0.0, 92.0), vec2(200.0, 26.0));
+    let resp = ui.interact(r, egui::Id::new("text.transcript.generate"), Sense::click());
+    ui.painter().rect_filled(r, 13.0, if resp.hovered() { t.accent_hover } else { t.accent });
+    ui.painter().text(r.center(), Align2::CENTER_CENTER, tl!("Transcribe"), Tokens::semibold(12.0), Color32::WHITE);
+    app.auto.add("text.transcript.generate", r, "Transcribe");
+    if resp.clicked() {
+        let params = if model.is_empty() { json!({}) } else { json!({"model": model}) };
+        actions.push(("transcript.generate".into(), params));
+    }
+}
+
+/// Start downloading speech model `id` as a background job; the id lands in the UI state so the
+/// panel can show progress and Cancel.
+fn download_model(app: &mut FilmcraftApp, id: &str) {
+    app.ui.transcript_confirm_download = false;
+    match app.session.execute("transcript.downloadModel", json!({"model": id})) {
+        Ok(r) => {
+            if r["installed"].as_bool().unwrap_or(false) {
+                app.ui.status = "Speech model already installed.".into();
+            } else {
+                app.ui.transcript_download_job = r["job"].as_u64();
+            }
+        }
+        Err(e) => app.ui.status = e.to_string(),
+    }
+}
+
+/// Progress and Cancel of the running speech-model download.
+fn download_progress(app: &mut FilmcraftApp, ui: &mut egui::Ui, _rect: Rect, c: egui::Pos2, w: f32, job_id: u64) {
+    let t = app.tokens;
+    let Some(j) = app.session.jobs.iter().find(|j| j.id == job_id) else {
+        app.ui.transcript_download_job = None;
+        return;
+    };
+    let frac = j.progress.fraction();
+    let status = j.progress.status.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    {
+        let mut child = ui.new_child(
+            egui::UiBuilder::new().max_rect(Rect::from_min_size(pos2(c.x - w / 2.0, c.y + 44.0), vec2(w, 66.0))).id_salt("transcript-download-progress"),
+        );
+        child.label(egui::RichText::new(status).color(t.text).size(11.5));
+        child.add(egui::ProgressBar::new(frac).show_percentage());
+        let b = child.small_button("Cancel");
+        app.auto.add("text.transcript.download.cancel", b.rect, "Cancel download");
+        if b.clicked() {
+            j.progress.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Settle a finished speech-model download: report it in the status line and clear the job.
+fn poll_download(app: &mut FilmcraftApp) {
+    let Some(job_id) = app.ui.transcript_download_job else { return };
+    let Some(j) = app.session.jobs.iter().find(|j| j.id == job_id) else {
+        app.ui.transcript_download_job = None;
+        return;
+    };
+    if !j.progress.finished.load(Ordering::Relaxed) {
+        return;
+    }
+    app.ui.transcript_download_job = None;
+    app.ui.transcript_confirm_download = false;
+    let r = j.result.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    app.ui.status = match r {
+        Some(Ok(_)) => "Speech model installed – ready to transcribe.".into(),
+        Some(Err(e)) => format!("Download of the speech model failed: {e}"),
+        None => "The download stopped.".into(),
+    };
 }
 
 fn filmcraft_speech_available(app: &FilmcraftApp) -> bool {

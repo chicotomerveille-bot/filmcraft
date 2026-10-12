@@ -33,7 +33,7 @@ the control channel and MCP agents can do the same.
 | `transcript.removeFillers` | Ripple-delete filler words (`fillers`, default um/uh/erm/…; phrases such as "you know" allowed). |
 | `transcript.removePauses` | Ripple-delete pauses longer than `minSeconds`, keeping `keepSeconds` of air on both sides. |
 | `transcript.createCaptions` | Lay the words out as captions on a new caption track (`maxChars`, `lines`, `minSeconds`, `maxSeconds`, `gapFrames`). |
-| `transcript.models` / `transcript.downloadModel` | List the speech models (size, licence, installed) / download one. |
+| `transcript.models` / `transcript.downloadModel` | List the speech models (size, licence, installed) / download one as a background job with progress and Cancel (`jobs.list`, `jobs.cancel`; `wait: true` blocks). |
 
 ## Speech recognition
 
@@ -43,7 +43,9 @@ with timestamp decoding, language detection and word times from cross-attention 
 `filmcraft_speech::whisper` module docs). Speakers are labelled by clustering per-chunk MFCC
 statistics (`filmcraft_speech::diarize`); no model is involved.
 
-Both are **optional features**, off by default and never built for the web:
+Both are **optional features**, off by default in development builds and never built for the
+web. The release packages (Linux, macOS, Windows, FreeBSD) build with them on, so Transcribe
+works out of the box and the Text panel offers the model download itself:
 
 - `whisper` (on `filmcraft-speech`, `filmcraft-engine`, and the `filmcraft` / `filmcraft-cli`
   apps, where it also enables downloads): candle inference.
@@ -57,6 +59,9 @@ on, `file.import` reports the same reason as a `transcription: …` entry in its
 Without `speech-download`, `transcript.downloadModel` is disabled the same way. Transcripts can
 still be imported with `transcript.set` and edited with every other command. Hosts and tests can
 install any recogniser in `Session::transcriber`, which enables transcription in any build.
+When the picked model is not downloaded yet, `transcript.generate` says so and points at
+`transcript.downloadModel`; the Text panel shows the download itself, with the model's size,
+source and licence to confirm first.
 
 ### Models
 
@@ -82,6 +87,7 @@ Apple-silicon laptop CPU).
 
 ## Limits
 
-- Transcription runs synchronously inside the command (no background job or progress bar yet).
+- Transcription runs synchronously inside the command (no background job or progress bar yet);
+  only the model download runs as a job.
 - Track items that refer to a subclip are looked up by the subclip's id, so a transcript made for
   the parent media is not shown through subclip clips yet.

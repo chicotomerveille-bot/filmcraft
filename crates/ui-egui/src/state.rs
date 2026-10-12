@@ -497,6 +497,15 @@ pub struct UiState {
     /// Text panel ▸ Transcript: search text.
     #[serde(default)]
     pub transcript_search: String,
+    /// Text panel ▸ Transcript: speech model picked for Transcribe ("" = the default model).
+    #[serde(default)]
+    pub transcript_model: String,
+    /// Text panel ▸ Transcript: the speech-model download confirmation is showing.
+    #[serde(default)]
+    pub transcript_confirm_download: bool,
+    /// Text panel ▸ Transcript: the running speech-model download job.
+    #[serde(default)]
+    pub transcript_download_job: Option<u64>,
     /// Preferences ▸ Playback: play the rendered range when a preview render finishes.
     #[serde(default = "yes")]
     pub play_after_render: bool,
@@ -983,6 +992,9 @@ impl Default for UiState {
             caption_search: String::new(),
             transcript_sel: None,
             transcript_search: String::new(),
+            transcript_model: String::new(),
+            transcript_confirm_download: false,
+            transcript_download_job: None,
             play_after_render: true,
             mixer_fx_open: false,
             mixer_hidden: Vec::new(),

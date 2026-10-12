@@ -159,6 +159,27 @@ fn set_delete_and_models() {
 }
 
 #[test]
+fn download_model_rejects_hostile_params() {
+    let (mut s, _, _) = session();
+    if cfg!(feature = "speech-download") {
+        // unknown models are refused before any download, in every build with downloads
+        for hostile in ["nope", "", "../..", "whisper-base.exe", "WHISPER-BASE"] {
+            let e = s.execute("transcript.downloadModel", json!({"model": hostile})).unwrap_err().to_string();
+            assert!(e.contains("unknown speech model"), "{hostile}: {e}");
+        }
+        // a model id of the wrong type is refused, never silently replaced by the default
+        let e = s.execute("transcript.downloadModel", json!({"model": 3})).unwrap_err().to_string();
+        assert!(e.contains("unknown speech model") || e.contains("must be a string"), "{e}");
+    } else {
+        // the command is disabled without the download feature, whatever the params (#98)
+        for hostile in ["nope", "whisper-base"] {
+            let e = s.execute("transcript.downloadModel", json!({"model": hostile})).unwrap_err().to_string();
+            assert!(e.contains("not available"), "{hostile}: {e}");
+        }
+    }
+}
+
+#[test]
 fn generate_without_a_transcriber() {
     let (mut s, item, _) = session();
     s.transcriber = None;

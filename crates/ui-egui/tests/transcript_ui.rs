@@ -1,13 +1,17 @@
 //! Headless UI test of the Text panel's Transcript tab: the Transcribe button, the word view,
-//! clicking words (In/Out from the selection) and extracting the selected text.
+//! clicking words (In/Out from the selection) and extracting the selected text; the empty state
+//! with speech available but no model downloaded (model picker, download confirmation).
 //!
 //! Set `FILMCRAFT_UI_SNAPSHOT_DIR=<dir>` to also render the window offscreen with wgpu and write
 //! `transcript-*.png` there; without it no GPU is needed.
 
+use std::sync::Arc;
 use std::sync::mpsc::{Sender, channel};
 
 use egui_kittest::Harness;
 use filmcraft_engine::Session;
+use filmcraft_project::Transcript;
+use filmcraft_speech::FixedTranscriber;
 use filmcraft_ui_egui::FilmcraftApp;
 use filmcraft_ui_egui::control::ControlRequest;
 use serde_json::{Value, json};
@@ -64,6 +68,10 @@ impl Driver {
     fn demo() -> Self {
         let mut session = Session::default();
         session.execute("file.openDemoProject", json!({})).expect("demo project");
+        Driver::with_session(session)
+    }
+
+    fn with_session(session: Session) -> Self {
         let (tx, rx) = channel();
         let app = FilmcraftApp::new(session).with_control(rx);
         let snapshots = std::env::var_os("FILMCRAFT_UI_SNAPSHOT_DIR").map(std::path::PathBuf::from);
@@ -151,4 +159,40 @@ fn transcript_tab_selects_and_extracts_words() {
     let left: Vec<&str> = r["words"].as_array().unwrap().iter().filter_map(|w| w["text"].as_str()).collect();
     assert_eq!(left, ["Hello", "there", "friend."]);
     assert_eq!(d.ids("text.transcript.word.").len(), 3);
+}
+
+#[test]
+fn transcript_empty_state_offers_model_download() {
+    // speech available through an installed recogniser, but no model downloaded and no
+    // transcript: the empty state offers the model picker and its download, not Transcribe
+    let mut session = Session::default();
+    session.execute("file.openDemoProject", json!({})).expect("demo project");
+    session.transcriber = Some(Arc::new(FixedTranscriber { transcript: Transcript::default(), id: "fixed".into() }));
+    let mut d = Driver::with_session(session);
+    d.ok("ui.set", json!({"workspace": "Captions and Graphics"}));
+    d.frames(2);
+    d.ok("ui.click", json!({"id": "text.tab.Transcript"}));
+    d.frames(3);
+    assert!(d.ids("text.transcript.generate").is_empty(), "Transcribe waits for the model");
+    assert_eq!(d.ids("text.transcript.model"), vec!["text.transcript.model".to_string()]);
+    assert_eq!(d.ids("text.transcript.download"), vec!["text.transcript.download".to_string()]);
+    d.snapshot("download");
+
+    // the download asks first (size, source, licence), and Cancel goes back
+    d.ok("ui.click", json!({"id": "text.transcript.download"}));
+    d.frames(3);
+    assert_eq!(d.ids("text.transcript.download.confirm"), vec!["text.transcript.download.confirm".to_string()]);
+    d.ok("ui.click", json!({"id": "text.transcript.download.cancel"}));
+    d.frames(3);
+    assert!(d.ids("text.transcript.download.confirm").is_empty());
+    assert_eq!(d.ids("text.transcript.download"), vec!["text.transcript.download".to_string()]);
+
+    // a hostile model id from ui.set falls back to the default instead of breaking the panel
+    d.ok("ui.set", json!({"transcriptModel": "../.."}));
+    d.frames(3);
+    assert_eq!(d.ids("text.transcript.model"), vec!["text.transcript.model".to_string()]);
+    assert_eq!(d.ids("text.transcript.download"), vec!["text.transcript.download".to_string()]);
+    d.ok("ui.set", json!({"transcriptModel": "whisper-tiny"}));
+    d.frames(3);
+    assert_eq!(d.ids("text.transcript.download"), vec!["text.transcript.download".to_string()]);
 }

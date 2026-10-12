@@ -139,6 +139,12 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
                     None => return err(format!("unknown tool `{t}`")),
                 }
             }
+            // Text panel ▸ Transcript: speech model picked for Transcribe (an unknown id
+            // falls back to the default model when the panel draws, never an error)
+            if let Some(m) = s("transcriptModel") {
+                app.ui.transcript_model = m.to_string();
+                app.ui.transcript_confirm_download = false;
+            }
             if let Some(w) = s("workspace") {
                 match crate::dock::find(&app.workspaces, w) {
                     Some(w) => app.set_workspace(&w),
