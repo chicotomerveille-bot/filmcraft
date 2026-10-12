@@ -542,7 +542,7 @@ fn a_hidden_layer_has_no_box_and_cannot_be_clicked() {
         let v = d.ok("ui.elements", json!({"prefix": layer}));
         v.as_array().unwrap().iter().map(|e| e["id"].as_str().unwrap().to_string()).collect()
     };
-    assert_eq!(ids(&mut d).len(), 14, "the layer, its eight handles, four corner circles and its anchor: {:?}", ids(&mut d));
+    assert_eq!(ids(&mut d).len(), 18, "the layer, its eight handles, four corner circles, its anchor and its four rotate zones: {:?}", ids(&mut d));
     let r = d.rect(&layer);
     let inside = (r[0] + r[2] / 4.0, r[1] + r[3] / 2.0);
 
@@ -561,7 +561,7 @@ fn a_hidden_layer_has_no_box_and_cannot_be_clicked() {
     // (elsewhere on it, so that the two clicks are not a double click)
     d.ok("ui.click", json!({"x": r[0] + r[2] * 0.75, "y": inside.1}));
     d.frames(4);
-    assert_eq!(ids(&mut d).len(), 14);
+    assert_eq!(ids(&mut d).len(), 18);
 }
 
 /// A double-click on a text layer edits it with all its text selected, so typing replaces it; while

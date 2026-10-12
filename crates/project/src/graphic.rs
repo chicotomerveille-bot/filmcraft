@@ -246,6 +246,8 @@ pub struct LayerSpec {
     pub uid: u64,
     /// Responsive Design – Position.
     pub pin: Option<crate::graphic_design::Pin>,
+    /// Text animators evaluated at this time (only the ones that can change the raster).
+    pub animators: Vec<crate::graphic_design::EvaluatedAnimator>,
     pub content: LayerContent,
     pub appearance: Appearance,
     pub transform: LayerTransform,
@@ -350,6 +352,7 @@ pub fn eval_layer(e: &EffectInstance, t: Tick, frame: (u32, u32)) -> Option<Laye
         enabled: e.enabled,
         uid: e.layer.as_ref().map_or(0, |x| x.uid),
         pin: e.layer.as_ref().and_then(|x| x.pin.clone()).filter(|p| p.any()),
+        animators: e.layer.as_ref().map_or(Vec::new(), |x| x.animators.iter().filter(|a| a.is_active()).map(|a| a.evaluate(t)).collect()),
         content,
         appearance: Appearance {
             fill: bb(e, "fill", t).then(|| cc(e, "fill_color", t)),

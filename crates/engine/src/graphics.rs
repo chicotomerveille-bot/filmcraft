@@ -9,6 +9,7 @@
 
 use filmcraft_geom::Vec2;
 use filmcraft_project::graphic::{self, LayerContent, SHAPE_OPTS, eval_layer, layer_display_name, layer_indices, new_shape_layer, new_text_layer};
+use filmcraft_project::graphic_design::TextAnimator;
 use filmcraft_project::{ClipId, EffectInstance, ItemId, ItemKind, Label, Param, ParamValue, Sequence, TrackKind};
 use filmcraft_render::graphic_clip::{item_layer_specs, layer_local_bounds, layer_quad, text_layout};
 use filmcraft_time::{Tick, TimeRange};
@@ -283,6 +284,74 @@ pub(crate) fn set_props(
     })
 }
 
+/// Animator index `animator` (default: the first) of a layer holding `n` animators.
+fn animator_index(p: &Value, cmd: &str, n: usize) -> Result<usize> {
+    let ai = match p.get("animator") {
+        None | Some(Value::Null) => 0,
+        Some(Value::Number(i)) => i.as_u64().map(|v| v as usize).ok_or_else(|| bad(cmd, "`animator` must be an index"))?,
+        Some(_) => return Err(bad(cmd, "`animator` must be an index")),
+    };
+    (ai < n).then_some(ai).ok_or_else(|| bad(cmd, format!("no animator {ai}")))
+}
+
+/// How many animators the layer `ei` of `clip` holds (0 when it has no layer data yet).
+fn animator_count(s: &Session, clip: ClipId, ei: usize) -> usize {
+    s.active_sequence().and_then(|q| q.find_item(clip)).and_then(|(_, it)| it.effects.get(ei)).and_then(|e| e.layer.as_ref()).map_or(0, |x| x.animators.len())
+}
+
+/// One animated scalar of an animator (`opacity`, `x`, `y`, `start`, `end`, `offset`).
+fn animator_param_mut<'a>(cmd: &str, e: &'a mut EffectInstance, ai: usize, field: &str) -> Result<&'a mut Param> {
+    if e.effect != graphic::TEXT_LAYER {
+        return Err(bad(cmd, "not a text layer"));
+    }
+    let n = e.layer.as_ref().map_or(0, |x| x.animators.len());
+    if ai >= n {
+        return Err(bad(cmd, format!("no animator {ai}")));
+    }
+    let a = &mut e.layer.as_mut().ok_or_else(|| bad(cmd, format!("no animator {ai}")))?.animators[ai];
+    Ok(match field {
+        "opacity" => &mut a.opacity,
+        "x" => &mut a.x,
+        "y" => &mut a.y,
+        "start" => &mut a.range.start,
+        "end" => &mut a.range.end,
+        "offset" => &mut a.range.offset,
+        _ => return Err(bad(cmd, format!("unknown field `{field}` (opacity, x, y, start, end, offset)"))),
+    })
+}
+
+/// Set animator values (keyframe-aware at time `tl`; `force` writes keyframes even on a static
+/// animator). `merge` folds consecutive calls into one undo step, like `graphics.set`.
+#[allow(clippy::too_many_arguments)]
+fn set_animator(s: &mut Session, clip: ClipId, ei: usize, ai: usize, vals: &[(String, f64)], tl: Tick, force: bool, merge: Option<&str>) -> Result<()> {
+    s.edit_sequence_as("Change Text Animator", merge, |q, _, _| {
+        let (_, it) = q.find_item_mut(clip).ok_or(filmcraft_edit::EditError::NoItem(clip))?;
+        let mt = it.source_time_at(tl.clamp(it.start, it.end() - Tick(1)));
+        let e = it.effects.get_mut(ei).ok_or_else(|| bad("graphics.setAnimator", "no such layer"))?;
+        if e.effect != graphic::TEXT_LAYER {
+            return Err(bad("graphics.setAnimator", "not a text layer"));
+        }
+        let a = e.layer.get_or_insert_with(Default::default).animators.get_mut(ai).ok_or_else(|| bad("graphics.setAnimator", format!("no animator {ai}")))?;
+        for (k, v) in vals {
+            let param = match k.as_str() {
+                "opacity" => &mut a.opacity,
+                "x" => &mut a.x,
+                "y" => &mut a.y,
+                "start" => &mut a.range.start,
+                "end" => &mut a.range.end,
+                _ => &mut a.range.offset,
+            };
+            let pv = ParamValue::Float(*v);
+            if force {
+                param.put_keyframe(mt, pv);
+            } else {
+                param.set_at(mt, pv);
+            }
+        }
+        Ok(())
+    })
+}
+
 /// Turn a text layer into point text (no box; the lines the box wrapped become real lines) or
 /// paragraph text (a box fitted to the text). The text stays where it is: the layer's origin
 /// moves between the first baseline and the box's top-left corner, and the anchor point is
@@ -408,6 +477,9 @@ fn list_layers(s: &Session, clip: ClipId) -> Result<Value> {
                 "anchor": [sp.transform.anchor.x, sp.transform.anchor.y],
                 "scale": sp.transform.scale.y * 100.0,
                 "scaleWidth": sp.transform.scale.x * 100.0,
+                "rotation": sp.transform.rotation,
+                "opacity": sp.transform.opacity * 100.0,
+                "animators": extra.map(|x| x.animators.iter().map(|a| a.name.clone()).collect::<Vec<_>>()).unwrap_or_default(),
                 "uid": extra.map_or(0, |x| x.uid),
                 "pin": extra.and_then(|x| x.pin.as_ref()).map(|p| serde_json::to_value(p).unwrap_or_default()),
                 "styles": extra.map(|x| serde_json::to_value(&x.runs).unwrap_or_default()).unwrap_or(json!([])),
@@ -1075,6 +1147,154 @@ pub fn commands() -> Vec<CommandSpec> {
             let clip = target_clip(s, p).ok_or_else(|| bad("graphics.list", "no graphic clip"))?;
             list_layers(s, clip)
         }),
+        spec(
+            "graphics.addAnimator",
+            "Add Text Animator",
+            &[],
+            None,
+            r#"{"clip":id?,"layer":n|name?,"name":str?,"opacity":0..100?=100,"x":px?=0,"y":px?=0,"start":%?=0,"end":%?=100,"offset":%?=0 (a typewriter reveal is opacity 0 with end animated 0→100)}"#,
+            has_graphic,
+            |s, p| {
+                const ID: &str = "graphics.addAnimator";
+                let clip = target_clip(s, p).ok_or_else(|| bad(ID, "no graphic clip"))?;
+                let (_, ei) = layer_effect_index(s, clip, p)?;
+                let name = str_p(p, "name").map(str::to_string).unwrap_or_default();
+                for k in ["opacity", "x", "y", "start", "end", "offset"] {
+                    if p.get(k).is_some_and(|v| v.as_f64().is_none()) {
+                        return Err(bad(ID, format!("`{k}`: value has the wrong type")));
+                    }
+                }
+                let vals: Vec<(String, f64)> = ["opacity", "x", "y", "start", "end", "offset"]
+                    .into_iter()
+                    .filter_map(|k| p.get(k).and_then(Value::as_f64).map(|v| (k.to_string(), v)))
+                    .collect();
+                let tl = time_p(s, p, "").unwrap_or_else(|| s.playhead());
+                let ai = s.edit_sequence("Add Text Animator", |q, _, _| {
+                    let (_, it) = q.find_item_mut(clip).ok_or(filmcraft_edit::EditError::NoItem(clip))?;
+                    let mt = it.source_time_at(tl.clamp(it.start, it.end() - Tick(1)));
+                    let e = it.effects.get_mut(ei).ok_or_else(|| bad(ID, "no such layer"))?;
+                    if e.effect != graphic::TEXT_LAYER {
+                        return Err(bad(ID, "not a text layer"));
+                    }
+                    let x = e.layer.get_or_insert_with(Default::default);
+                    let n = x.animators.len();
+                    let mut a = TextAnimator::new(if name.is_empty() { format!("Animator {}", n + 1) } else { name.clone() });
+                    for (k, v) in &vals {
+                        let param = match k.as_str() {
+                            "opacity" => &mut a.opacity,
+                            "x" => &mut a.x,
+                            "y" => &mut a.y,
+                            "start" => &mut a.range.start,
+                            "end" => &mut a.range.end,
+                            _ => &mut a.range.offset,
+                        };
+                        param.set_at(mt, ParamValue::Float(*v));
+                    }
+                    x.animators.push(a);
+                    Ok(n)
+                })?;
+                Ok(json!({"animator": ai}))
+            },
+        ),
+        spec(
+            "graphics.setAnimator",
+            "Set Text Animator",
+            &[],
+            None,
+            r#"{"clip":id?,"layer":n|name?,"animator":n?=0,"opacity":0..100?,"x":px?,"y":px?,"start":%?,"end":%?,"offset":%?,"keyframe":bool?=false (force a keyframe),"time":ticks?,"merge":bool?,"begin":bool?}"#,
+            has_graphic,
+            |s, p| {
+                const ID: &str = "graphics.setAnimator";
+                let clip = target_clip(s, p).ok_or_else(|| bad(ID, "no graphic clip"))?;
+                let (_, ei) = layer_effect_index(s, clip, p)?;
+                let ai = animator_index(p, ID, animator_count(s, clip, ei))?;
+                for k in ["opacity", "x", "y", "start", "end", "offset"] {
+                    if p.get(k).is_some_and(|v| v.as_f64().is_none()) {
+                        return Err(bad(ID, format!("`{k}`: value has the wrong type")));
+                    }
+                }
+                let vals: Vec<(String, f64)> = ["opacity", "x", "y", "start", "end", "offset"]
+                    .into_iter()
+                    .filter_map(|k| p.get(k).and_then(Value::as_f64).map(|v| (k.to_string(), v)))
+                    .collect();
+                if vals.is_empty() {
+                    return Err(bad(ID, "need one of `opacity`, `x`, `y`, `start`, `end`, `offset`"));
+                }
+                let tl = time_p(s, p, "").unwrap_or_else(|| s.playhead());
+                // `merge`: a drag of a value is one undo step; `begin` starts a new one (#201)
+                let merge = bool_p(p, "merge").unwrap_or(false).then(|| format!("graphics.setAnimator:{}:{ei}:{ai}", clip.0));
+                if bool_p(p, "begin").unwrap_or(false) {
+                    s.history.merge_key = None;
+                }
+                let force = bool_p(p, "keyframe").unwrap_or(false);
+                set_animator(s, clip, ei, ai, &vals, tl, force, merge.as_deref())?;
+                Ok(Value::Null)
+            },
+        ),
+        spec("graphics.removeAnimator", "Remove Text Animator", &[], None, r#"{"clip":id?,"layer":n|name?,"animator":n?=0}"#, has_graphic, |s, p| {
+            const ID: &str = "graphics.removeAnimator";
+            let clip = target_clip(s, p).ok_or_else(|| bad(ID, "no graphic clip"))?;
+            let (_, ei) = layer_effect_index(s, clip, p)?;
+            let ai = animator_index(p, ID, animator_count(s, clip, ei))?;
+            s.edit_sequence("Remove Text Animator", |q, _, _| {
+                let (_, it) = q.find_item_mut(clip).ok_or(filmcraft_edit::EditError::NoItem(clip))?;
+                let e = it.effects.get_mut(ei).ok_or_else(|| bad(ID, "no such layer"))?;
+                let x = e.layer.as_mut().ok_or_else(|| bad(ID, format!("no animator {ai}")))?;
+                if ai >= x.animators.len() {
+                    return Err(bad(ID, format!("no animator {ai}")));
+                }
+                x.animators.remove(ai);
+                Ok(())
+            })?;
+            Ok(Value::Null)
+        }),
+        spec(
+            "graphics.toggleAnimator",
+            "Toggle Text Animator Animation",
+            &[],
+            None,
+            r#"{"clip":id?,"layer":n|name?,"animator":n?=0,"field":"opacity|x|y|start|end|offset"=opacity}"#,
+            has_graphic,
+            |s, p| {
+                const ID: &str = "graphics.toggleAnimator";
+                let clip = target_clip(s, p).ok_or_else(|| bad(ID, "no graphic clip"))?;
+                let (_, ei) = layer_effect_index(s, clip, p)?;
+                let ai = animator_index(p, ID, animator_count(s, clip, ei))?;
+                let field = str_p(p, "field").unwrap_or("opacity").to_string();
+                let tl = time_p(s, p, "").unwrap_or_else(|| s.playhead());
+                s.edit_sequence("Toggle Text Animator", |q, _, _| {
+                    let (_, it) = q.find_item_mut(clip).ok_or(filmcraft_edit::EditError::NoItem(clip))?;
+                    let mt = it.source_time_at(tl.clamp(it.start, it.end() - Tick(1)));
+                    let e = it.effects.get_mut(ei).ok_or_else(|| bad(ID, "no such layer"))?;
+                    animator_param_mut(ID, e, ai, &field)?.toggle_animation(mt);
+                    Ok(())
+                })?;
+                Ok(Value::Null)
+            },
+        ),
+        spec(
+            "graphics.removeAnimatorKeyframe",
+            "Remove Text Animator Keyframe",
+            &[],
+            None,
+            r#"{"clip":id?,"layer":n|name?,"animator":n?=0,"field":"opacity|x|y|start|end|offset"=opacity}"#,
+            has_graphic,
+            |s, p| {
+                const ID: &str = "graphics.removeAnimatorKeyframe";
+                let clip = target_clip(s, p).ok_or_else(|| bad(ID, "no graphic clip"))?;
+                let (_, ei) = layer_effect_index(s, clip, p)?;
+                let ai = animator_index(p, ID, animator_count(s, clip, ei))?;
+                let field = str_p(p, "field").unwrap_or("opacity").to_string();
+                let tl = time_p(s, p, "").unwrap_or_else(|| s.playhead());
+                s.edit_sequence("Remove Text Animator Keyframe", |q, _, _| {
+                    let (_, it) = q.find_item_mut(clip).ok_or(filmcraft_edit::EditError::NoItem(clip))?;
+                    let mt = it.source_time_at(tl.clamp(it.start, it.end() - Tick(1)));
+                    let e = it.effects.get_mut(ei).ok_or_else(|| bad(ID, "no such layer"))?;
+                    if animator_param_mut(ID, e, ai, &field)?.remove_keyframe_at(mt) { Ok(()) } else { Err(bad(ID, "no keyframe here")) }
+                })?;
+                Ok(Value::Null)
+            },
+        ),
         query("fonts.list", "List Fonts", r#"{"system":bool=true (scan the system font folders)}"#, |_, p| {
             if p.get("system").and_then(Value::as_bool).unwrap_or(true) {
                 filmcraft_text::fonts::scan_system();

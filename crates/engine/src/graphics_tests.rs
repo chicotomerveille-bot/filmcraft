@@ -658,3 +658,123 @@ fn a_layer_saved_before_the_box_height_existed_can_still_get_one() {
     s.execute("graphics.set", json!({"clip": clip.0, "props": {"box_height": 100}})).unwrap();
     assert_eq!(s.execute("graphics.list", json!({"clip": clip.0})).unwrap()["layers"][0]["box"], json!([500.0, 100.0]));
 }
+
+fn animator_opacity(s: &Session, clip: ClipId, layer: usize, ai: usize, t: Tick) -> f32 {
+    let q = s.active_sequence().unwrap();
+    let (_, it) = q.find_item(clip).unwrap();
+    let ei = layer_indices(&it.effects)[layer];
+    let (w, h) = (q.settings.width, q.settings.height);
+    eval_layer(&it.effects[ei], t, (w, h)).unwrap().animators[ai].opacity
+}
+
+#[test]
+fn text_animators_add_set_remove_and_undo() {
+    let mut s = demo();
+    let r = s.execute("graphics.newText", json!({"text": "ABCD"})).unwrap();
+    let clip = ClipId(r["clip"].as_u64().unwrap());
+    // add two animators (default and named)
+    assert_eq!(s.execute("graphics.addAnimator", json!({"clip": clip.0})).unwrap(), json!({"animator": 0}));
+    assert_eq!(s.execute("graphics.addAnimator", json!({"clip": clip.0, "name": "Rise"})).unwrap(), json!({"animator": 1}));
+    // static fade on the first: the evaluated spec carries it
+    s.execute("graphics.setAnimator", json!({"clip": clip.0, "animator": 0, "opacity": 0.0, "start": 50.0, "end": 100.0})).unwrap();
+    let specs = layers(&s, clip);
+    assert_eq!(specs.len(), 1);
+    assert_eq!(specs[0].animators.len(), 1, "only the active animator evaluates");
+    assert_eq!((specs[0].animators[0].opacity, specs[0].animators[0].start, specs[0].animators[0].end), (0.0, 50.0, 100.0));
+    // keyframed rise on the second: still at the clip start, +60 px 2 s later
+    let start = s.active_sequence().unwrap().find_item(clip).unwrap().1.start;
+    s.execute("playhead.set", json!({"time": start.0})).unwrap();
+    s.execute("graphics.setAnimator", json!({"clip": clip.0, "animator": 1, "x": 0.0, "keyframe": true})).unwrap();
+    s.execute("playhead.set", json!({"time": (start + Tick::from_seconds_f64(2.0)).0})).unwrap();
+    s.execute("graphics.setAnimator", json!({"clip": clip.0, "animator": 1, "x": 60.0, "keyframe": true})).unwrap();
+    let q = s.active_sequence().unwrap();
+    let (_, it) = q.find_item(clip).unwrap();
+    let ei = layer_indices(&it.effects)[0];
+    let (w, h) = (q.settings.width, q.settings.height);
+    let at = |t: Tick| eval_layer(&it.effects[ei], t, (w, h)).unwrap().animators;
+    assert_eq!(at(Tick::ZERO).len(), 2);
+    // keyframes land on frame-snapped times: read them back instead of assuming exact seconds
+    let keys = &it.effects[ei].layer.as_ref().unwrap().animators[1].x.keyframes;
+    assert_eq!(keys.len(), 2);
+    let (t0, t1) = (keys[0].time, keys[1].time);
+    assert!(t1 > t0, "two distinct keyframes");
+    assert_eq!(at(t0)[1].dx, 0.0);
+    assert_eq!(at(t1)[1].dx, 60.0);
+    assert!((at(Tick((t0.0 + t1.0) / 2))[1].dx - 30.0).abs() < 1e-4, "linear midpoint");
+    // remove the first animator; undo brings it back
+    s.execute("graphics.removeAnimator", json!({"clip": clip.0, "animator": 0})).unwrap();
+    assert_eq!(layers(&s, clip)[0].animators.len(), 1);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(layers(&s, clip)[0].animators.len(), 2);
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(layers(&s, clip)[0].animators.len(), 1);
+    // the helper reads through the same path
+    assert_eq!(animator_opacity(&s, clip, 0, 0, Tick::ZERO), 100.0);
+    // initial values ride along in the add call: a one-step typewriter base
+    let ai = s.execute("graphics.addAnimator", json!({"clip": clip.0, "name": "Typewriter", "opacity": 0.0})).unwrap()["animator"].as_u64().unwrap() as usize;
+    let op = animator_opacity(&s, clip, 0, ai, Tick::ZERO);
+    assert_eq!(op, 0.0);
+}
+
+#[test]
+fn text_animators_refuse_hostile_params() {
+    let mut s = demo();
+    let r = s.execute("graphics.newText", json!({"text": "ABCD"})).unwrap();
+    let clip = ClipId(r["clip"].as_u64().unwrap());
+    // nothing to address yet
+    let e = s.execute("graphics.setAnimator", json!({"clip": clip.0, "opacity": 0.0})).unwrap_err().to_string();
+    assert!(e.contains("no animator 0"), "{e}");
+    let e = s.execute("graphics.removeAnimator", json!({"clip": clip.0})).unwrap_err().to_string();
+    assert!(e.contains("no animator 0"), "{e}");
+    s.execute("graphics.addAnimator", json!({"clip": clip.0})).unwrap();
+    // wrong types are refused everywhere, including the add call's initial values
+    let e = s.execute("graphics.addAnimator", json!({"clip": clip.0, "opacity": "gone"})).unwrap_err().to_string();
+    assert!(e.contains("wrong type"), "{e}");
+    // unknown animator, wrong types, empty values
+    let e = s.execute("graphics.setAnimator", json!({"clip": clip.0, "animator": 7, "opacity": 0.0})).unwrap_err().to_string();
+    assert!(e.contains("no animator 7"), "{e}");
+    let e = s.execute("graphics.setAnimator", json!({"clip": clip.0, "animator": "first"})).unwrap_err().to_string();
+    assert!(e.contains("must be an index"), "{e}");
+    let e = s.execute("graphics.setAnimator", json!({"clip": clip.0, "opacity": "gone"})).unwrap_err().to_string();
+    assert!(e.contains("wrong type"), "{e}");
+    let e = s.execute("graphics.setAnimator", json!({"clip": clip.0})).unwrap_err().to_string();
+    assert!(e.contains("need one of"), "{e}");
+    // shape layers animate nothing per character
+    let sh = s.execute("graphics.newShape", json!({"shape": "ellipse"})).unwrap();
+    let sh = ClipId(sh["clip"].as_u64().unwrap());
+    let e = s.execute("graphics.addAnimator", json!({"clip": sh.0})).unwrap_err().to_string();
+    assert!(e.contains("not a text layer"), "{e}");
+    // unknown clips and layers are refused before any animator is touched
+    assert!(s.execute("graphics.addAnimator", json!({"clip": 999_999})).is_err());
+    assert!(s.execute("graphics.setAnimator", json!({"clip": clip.0, "layer": 9, "opacity": 0.0})).is_err());
+}
+
+#[test]
+fn text_animators_toggle_and_drop_keyframes() {
+    let mut s = demo();
+    let r = s.execute("graphics.newText", json!({"text": "ABCD"})).unwrap();
+    let clip = ClipId(r["clip"].as_u64().unwrap());
+    s.execute("graphics.addAnimator", json!({"clip": clip.0})).unwrap();
+    // stopwatch on: one keyframe at the playhead with the current value
+    let s0 = s.playhead();
+    s.execute("graphics.toggleAnimator", json!({"clip": clip.0, "field": "opacity"})).unwrap();
+    assert_eq!(animator_opacity(&s, clip, 0, 0, Tick::ZERO), 100.0);
+    // a keyframe 2 s into the clip, then drop the one at the playhead
+    let start = s.active_sequence().unwrap().find_item(clip).unwrap().1.start;
+    s.execute("playhead.set", json!({"time": (start + Tick::from_seconds_f64(2.0)).0})).unwrap();
+    s.execute("graphics.setAnimator", json!({"clip": clip.0, "opacity": 0.0, "keyframe": true})).unwrap();
+    s.execute("playhead.set", json!({"time": s0.0})).unwrap();
+    s.execute("graphics.removeAnimatorKeyframe", json!({"clip": clip.0, "field": "opacity"})).unwrap();
+    // hostile fields and missing keyframes
+    let e = s.execute("graphics.toggleAnimator", json!({"clip": clip.0, "field": "blur"})).unwrap_err().to_string();
+    assert!(e.contains("unknown field"), "{e}");
+    let e = s.execute("graphics.removeAnimatorKeyframe", json!({"clip": clip.0, "field": "opacity"})).unwrap_err().to_string();
+    assert!(e.contains("no keyframe here"), "{e}");
+    // stopwatch off keeps the value and clears the keys; undo restores them
+    s.execute("graphics.toggleAnimator", json!({"clip": clip.0, "field": "opacity"})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    let q = s.active_sequence().unwrap();
+    let (_, it) = q.find_item(clip).unwrap();
+    let ei = layer_indices(&it.effects)[0];
+    assert!(it.effects[ei].layer.as_ref().unwrap().animators[0].opacity.is_animated());
+}

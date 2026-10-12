@@ -3594,3 +3594,8 @@
 	Export the labels to a preset file…	ラベルをプリセットファイルに書き出し…
 	Show the presets folder	プリセットフォルダーを表示
 	Delete this preset	このプリセットを削除
+	Add Text Animator	テキストアニメーターを追加
+	Set Text Animator	テキストアニメーターを設定
+	Remove Text Animator	テキストアニメーターを削除
+	Toggle Text Animator Animation	テキストアニメーターのアニメーションのオン / オフを切り替え
+	Remove Text Animator Keyframe	テキストアニメーターのキーフレームを削除

@@ -1,9 +1,13 @@
 //! Effect Controls: the selected clip's effects (fixed Motion/Opacity/Time Remapping first, as in
 //! Premiere, then standard effects), generated from parameter schemas, with stopwatches and a
-//! keyframe lane on the right. Also hosts the Lumetri Color panel body (same editor, grouped).
+//! keyframe lane on the right. Text layers also show their per-character animators (opacity and
+//! offset through a range selector), with the same stopwatch / editor / navigator rows. Also
+//! hosts the Lumetri Color panel body (same editor, grouped).
 
 use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, pos2, vec2};
-use filmcraft_project::{ClipId, EffectInstance, ParamKind, ParamValue, TrackItem, TrackKind};
+use filmcraft_project::graphic::layer_indices;
+use filmcraft_project::graphic_design::TextAnimator;
+use filmcraft_project::{ClipId, EffectInstance, Param, ParamKind, ParamValue, TrackItem, TrackKind};
 use filmcraft_time::Tick;
 use serde_json::{Value, json};
 
@@ -236,6 +240,11 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 }
                 if !open {
                     continue;
+                }
+                // text animators first: the add row stays reachable without scrolling past
+                // every layer parameter
+                if filmcraft_project::graphic::is_layer_id(&e.effect) && e.effect == filmcraft_project::graphic::TEXT_LAYER {
+                    animator_rows(app, bui, body, clip, idx, e, mt_now, &mut actions, &lane, it);
                 }
                 if crate::panels::audio_fx_editor::has_editor(&e.effect) {
                     custom_setup_row(app, bui, body, &lane, clip, idx, &e.effect);
@@ -637,8 +646,7 @@ pub(crate) fn param_row(
     }
     if let Some(v) = set {
         actions.push(("effects.setParam".into(), with_mask(json!({"clip": clip.0, "effect": idx, "param": pd.id, "value": v}))));
-    }
-    // keyframe navigator ◀ ◆ ▶ (when animated)
+    } // keyframe navigator ◀ ◆ ▶ (when animated)
     let eff_json = json!(idx);
     if pd.animatable && param.is_animated() {
         let at = pos2(r.max.x - 42.0, r.center().y);
@@ -683,6 +691,171 @@ pub(crate) fn param_row(
             resp.context_menu(|ui| {
                 keyframe_menu(app, ui, KeyframeRef { clip: clip.0, effect: idx, param: pd.id.to_string(), mask, time: k.time }, actions);
             });
+        }
+    }
+}
+
+/// One animated scalar of a text animator: id, label, unit, hard range and drag speed.
+const ANIMATOR_FIELDS: [(&str, &str, &str, (f64, f64), f64); 6] = [
+    ("opacity", "Opacity", "%", (0.0, 100.0), 0.5),
+    ("x", "Offset X", "px", (-100_000.0, 100_000.0), 1.0),
+    ("y", "Offset Y", "px", (-100_000.0, 100_000.0), 1.0),
+    ("start", "Range Start", "%", (-10_000.0, 10_000.0), 1.0),
+    ("end", "Range End", "%", (-10_000.0, 10_000.0), 1.0),
+    ("offset", "Range Offset", "%", (-10_000.0, 10_000.0), 1.0),
+];
+
+fn animator_field<'a>(a: &'a TextAnimator, field: &str) -> Option<&'a Param> {
+    Some(match field {
+        "opacity" => &a.opacity,
+        "x" => &a.x,
+        "y" => &a.y,
+        "start" => &a.range.start,
+        "end" => &a.range.end,
+        "offset" => &a.range.offset,
+        _ => return None,
+    })
+}
+
+/// Text animator rows of a text layer (Premiere's per-character animators): one header per
+/// animator (name, remove) with an add row, and one row per animated scalar (stopwatch,
+/// editor, keyframe navigator). Lane diamonds and value graphs stay effect parameters only
+/// for now (see `docs/graphics.md`). Automation ids:
+/// `effectControls.graphic_text.animator.<ai>[.<field>[.stopwatch|.addKeyframe|.prevKeyframe|.nextKeyframe]]`,
+/// `.remove`, `.add`.
+#[allow(clippy::too_many_arguments)]
+fn animator_rows(
+    app: &mut FilmcraftApp,
+    ui: &mut egui::Ui,
+    body: Rect,
+    clip: ClipId,
+    idx: usize,
+    e: &EffectInstance,
+    mt: Tick,
+    actions: &mut Vec<(String, Value)>,
+    lane: &Rect,
+    it: &TrackItem,
+) {
+    let t = app.tokens;
+    let Some(layer_no) = layer_indices(&it.effects).iter().position(|i| *i == idx) else { return };
+    let animators = e.layer.as_ref().map_or(&[][..], |x| &x.animators[..]);
+    for (ai, a) in animators.iter().enumerate() {
+        let key = format!("{}:{idx}:anim{ai}", clip.0);
+        let open = !app.ui.collapsed_fx.contains(&key);
+        let (r, _) = ui.allocate_exact_size(vec2(body.width(), ROW_H), Sense::hover());
+        row_line(ui, r, lane, &t);
+        let tw = Rect::from_center_size(pos2(r.min.x + 22.0, r.center().y), vec2(10.0, 10.0));
+        icons::paint(ui.painter(), tw, if open { Icon::ChevronDown } else { Icon::ChevronRight }, t.text_dim);
+        let twresp = ui.interact(tw.expand(3.0), egui::Id::new(("anim-twirl", clip.0, idx, ai)), Sense::click());
+        app.auto.add(&format!("effectControls.{}.animator.{ai}", e.effect), tw, "twirl");
+        if twresp.clicked() {
+            if open {
+                app.ui.collapsed_fx.push(key.clone());
+            } else {
+                app.ui.collapsed_fx.retain(|k| *k != key);
+            }
+        }
+        let name = if a.name.is_empty() { format!("Animator {}", ai + 1) } else { a.name.clone() };
+        row_label(ui, pos2(r.min.x + 38.0, r.center().y), &name, r.max.x - 40.0 - (r.min.x + 38.0), Tokens::semibold(11.5), t.text);
+        let rr = Rect::from_center_size(pos2(r.max.x - 14.0, r.center().y), vec2(16.0, 16.0));
+        let rresp = ui.interact(rr, egui::Id::new(("anim-remove", clip.0, idx, ai)), Sense::click()).on_hover_text("Remove animator");
+        icons::paint(ui.painter(), rr.shrink(2.0), Icon::Trash, if rresp.hovered() { t.text } else { t.text_dim });
+        app.auto.add(&format!("effectControls.{}.animator.{ai}.remove", e.effect), rr, "Remove animator");
+        if rresp.clicked() {
+            actions.push(("graphics.removeAnimator".into(), json!({"clip": clip.0, "layer": layer_no, "animator": ai})));
+        }
+        if !open {
+            continue;
+        }
+        for (field, label, unit, (min, max), speed) in ANIMATOR_FIELDS {
+            let Some(param) = animator_field(a, field) else { continue };
+            animator_field_row(app, ui, body, clip, idx, layer_no, ai, &e.effect, field, label, unit, (min, max), speed, param, mt, actions, lane, it);
+        }
+    }
+    // add row
+    let (r, _) = ui.allocate_exact_size(vec2(body.width(), ROW_H), Sense::hover());
+    row_line(ui, r, lane, &t);
+    let br = Rect::from_min_size(pos2(r.min.x + 38.0, r.center().y - 9.0), vec2(150.0, 18.0));
+    let bresp = ui.interact(br, egui::Id::new(("anim-add", clip.0, idx)), Sense::click());
+    icons::paint(ui.painter(), Rect::from_center_size(pos2(br.min.x + 8.0, br.center().y), vec2(12.0, 12.0)), Icon::Plus, t.text_dim);
+    ui.painter().text(
+        pos2(br.min.x + 18.0, br.center().y),
+        Align2::LEFT_CENTER,
+        "Add animator",
+        Tokens::ui(11.5),
+        if bresp.hovered() { t.text } else { t.text_dim },
+    );
+    app.auto.add(&format!("effectControls.{}.animator.add", e.effect), br, "Add animator");
+    if bresp.clicked() {
+        actions.push(("graphics.addAnimator".into(), json!({"clip": clip.0, "layer": layer_no})));
+    }
+}
+
+/// One animated scalar row of a text animator: stopwatch, hot-number editor and keyframe
+/// navigator, dispatching the `graphics.*Animator*` commands (drags merge through [`run`]).
+#[allow(clippy::too_many_arguments)]
+fn animator_field_row(
+    app: &mut FilmcraftApp,
+    ui: &mut egui::Ui,
+    body: Rect,
+    clip: ClipId,
+    idx: usize,
+    layer_no: usize,
+    ai: usize,
+    effect: &str,
+    field: &str,
+    label: &str,
+    unit: &str,
+    range: (f64, f64),
+    speed: f64,
+    param: &Param,
+    mt: Tick,
+    actions: &mut Vec<(String, Value)>,
+    lane: &Rect,
+    it: &TrackItem,
+) {
+    let t = app.tokens;
+    let auto = format!("effectControls.{effect}.animator.{ai}.{field}");
+    let (r, _) = ui.allocate_exact_size(vec2(body.width(), ROW_H), Sense::hover());
+    row_line(ui, r, lane, &t);
+    let mut x = r.min.x + 40.0;
+    let sw = Rect::from_center_size(pos2(x, r.center().y), vec2(14.0, 14.0));
+    let resp = ui.interact(sw, egui::Id::new(("anim-sw", clip.0, idx, ai, field)), Sense::click()).on_hover_text(tl!("Toggle animation"));
+    icons::paint(ui.painter(), sw, Icon::Stopwatch, if param.is_animated() { t.accent } else { t.text_dim });
+    if resp.clicked() {
+        actions.push(("graphics.toggleAnimator".into(), json!({"clip": clip.0, "layer": layer_no, "animator": ai, "field": field})));
+    }
+    app.auto.add(&format!("{auto}.stopwatch"), sw, "Toggle animation");
+    x += 14.0;
+    let vx = r.min.x + (r.width() * 0.5).max(150.0);
+    row_label(ui, pos2(x, r.center().y), label, vx - 6.0 - x, Tokens::ui(12.0), t.text);
+    let mut vui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(Rect::from_min_max(pos2(vx, r.min.y + 1.0), pos2(r.max.x - 26.0, r.max.y - 1.0)))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    let id = egui::Id::new(("anim-pv", clip.0, idx, ai, field));
+    let (_, nv) = crate::widgets::hot_number(&mut vui, id, param.f64_at(mt), speed, range, 1, unit, &t);
+    if let Some(nv) = nv {
+        let mut m = serde_json::Map::new();
+        m.insert("clip".into(), json!(clip.0));
+        m.insert("layer".into(), json!(layer_no));
+        m.insert("animator".into(), json!(ai));
+        m.insert(field.to_string(), json!(nv));
+        actions.push(("graphics.setAnimator".into(), Value::Object(m)));
+    }
+    let at = pos2(r.max.x - 42.0, r.center().y);
+    if keyframe_nav(app, ui, at, Some(param), mt, it, egui::Id::new(("anim-knav", clip.0, idx, ai, field)), &auto, "Add/Remove Keyframe", actions) {
+        if param.keyframes.iter().any(|k| k.time == mt) {
+            actions.push(("graphics.removeAnimatorKeyframe".into(), json!({"clip": clip.0, "layer": layer_no, "animator": ai, "field": field})));
+        } else {
+            let mut m = serde_json::Map::new();
+            m.insert("clip".into(), json!(clip.0));
+            m.insert("layer".into(), json!(layer_no));
+            m.insert("animator".into(), json!(ai));
+            m.insert(field.to_string(), json!(nv.unwrap_or_else(|| param.f64_at(mt))));
+            m.insert("keyframe".into(), json!(true));
+            actions.push(("graphics.setAnimator".into(), Value::Object(m)));
         }
     }
 }
@@ -982,7 +1155,8 @@ pub(crate) fn run(app: &mut FilmcraftApp, ctx: &egui::Context, actions: Vec<(Str
     let begun = ctx.data(|d| d.get_temp::<Option<f64>>(key)).flatten();
     let mut wrote = false;
     for (cmd, mut p) in actions {
-        if cmd == "effects.setParam" && down {
+        // animator drags merge like parameter drags (both commands take `merge` / `begin`)
+        if (cmd == "effects.setParam" || cmd == "graphics.setAnimator") && down {
             if p.get("merge").is_none() {
                 p["merge"] = json!(true);
             }

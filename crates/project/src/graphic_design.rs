@@ -6,6 +6,10 @@
 //!   [`apply_char_style`] merges a new style into a range and [`adjust_runs`] keeps runs on the
 //!   right characters when the text is edited (typed characters take the style of the character
 //!   before them).
+//! - **Text animators** ([`TextAnimator`]): opacity and positional offset applied per character
+//!   through a keyframable [`RangeSelector`]; every scalar is a keyframable [`Param`](crate::keyframe::Param),
+//!   evaluated with [`TextAnimator::evaluate`] and combined in list order (opacities multiply,
+//!   offsets add).
 //! - **Responsive Design – Position** ([`Pin`]): a layer's edges pinned to another layer (by its
 //!   [`LayerExtra::uid`]) or to the video frame keep their distance to the same edges of the
 //!   target, so a box pinned to a text layer grows with the text. [`resolve_pins`] works on plain
@@ -22,6 +26,7 @@ use filmcraft_time::Tick;
 use serde::{Deserialize, Serialize};
 
 use crate::effect::EffectInstance;
+use crate::keyframe::{Param, ParamValue};
 
 fn is_zero(v: &u64) -> bool {
     *v == 0
@@ -41,11 +46,15 @@ pub struct LayerExtra {
     /// Responsive Design – Position.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pin: Option<Pin>,
+    /// Per-character text animators of a text layer (opacity and positional offset through a
+    /// range selector; see [`TextAnimator::evaluate`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub animators: Vec<TextAnimator>,
 }
 
 impl LayerExtra {
     pub fn is_empty(&self) -> bool {
-        self.uid == 0 && self.runs.is_empty() && self.pin.is_none()
+        self.uid == 0 && self.runs.is_empty() && self.pin.is_none() && self.animators.is_empty()
     }
 }
 
@@ -178,6 +187,119 @@ pub fn adjust_runs(old: &str, new: &str, runs: &[StyleRun]) -> Vec<StyleRun> {
     out.extend(std::iter::repeat_n(fill, inserted));
     out.extend_from_slice(&v[a.len() - suf..]);
     compress(&out)
+}
+
+/// A per-character text animator (Premiere-style): opacity and positional offset applied
+/// through a range selector. Each scalar is a keyframable [`Param`], so animators reuse the
+/// project's keyframe machinery (interpolation, undo, save/load) and evaluate with
+/// [`TextAnimator::evaluate`] at clip time. Several animators combine: opacities multiply,
+/// offsets add, in list order.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TextAnimator {
+    pub name: String,
+    /// Opacity applied inside the selection, % (100 = unchanged).
+    pub opacity: Param,
+    /// Positional offset inside the selection, layer px.
+    pub x: Param,
+    pub y: Param,
+    pub range: RangeSelector,
+}
+
+/// Which characters an animator affects: `start..=end` in % of the text length, shifted by
+/// `offset` (all three keyframable). The selection ramps smoothly from 0 to 1 between the
+/// shifted bounds (see [`range_factor`]); equal bounds select everything past them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RangeSelector {
+    pub start: Param,
+    pub end: Param,
+    pub offset: Param,
+}
+
+/// A [`TextAnimator`] evaluated at one clip time: plain floats the renderer consumes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EvaluatedAnimator {
+    /// Opacity inside the selection, %.
+    pub opacity: f32,
+    /// Offset inside the selection, layer px.
+    pub dx: f32,
+    pub dy: f32,
+    /// Shifted selection bounds in % of the text length.
+    pub start: f32,
+    pub end: f32,
+    pub offset: f32,
+}
+
+fn float_param(v: f64) -> Param {
+    Param::new(ParamValue::Float(v))
+}
+
+impl Default for RangeSelector {
+    fn default() -> Self {
+        Self { start: float_param(0.0), end: float_param(100.0), offset: float_param(0.0) }
+    }
+}
+
+impl Default for TextAnimator {
+    fn default() -> Self {
+        Self { name: String::new(), opacity: float_param(100.0), x: float_param(0.0), y: float_param(0.0), range: RangeSelector::default() }
+    }
+}
+
+impl TextAnimator {
+    pub fn new(name: String) -> Self {
+        Self { name, ..Default::default() }
+    }
+    /// Plain-float state at clip time `t`.
+    pub fn evaluate(&self, t: Tick) -> EvaluatedAnimator {
+        EvaluatedAnimator {
+            opacity: self.opacity.f64_at(t) as f32,
+            dx: self.x.f64_at(t) as f32,
+            dy: self.y.f64_at(t) as f32,
+            start: self.range.start.f64_at(t) as f32,
+            end: self.range.end.f64_at(t) as f32,
+            offset: self.range.offset.f64_at(t) as f32,
+        }
+    }
+    /// Whether it can change the raster: animated, or a static value off its default.
+    pub fn is_active(&self) -> bool {
+        fn off(p: &Param, def: f64) -> bool {
+            p.is_animated() || p.value.as_f64().is_some_and(|v| v != def)
+        }
+        off(&self.opacity, 100.0)
+            || off(&self.x, 0.0)
+            || off(&self.y, 0.0)
+            || off(&self.range.start, 0.0)
+            || off(&self.range.end, 100.0)
+            || off(&self.range.offset, 0.0)
+    }
+}
+
+/// How much character `i` of `n` is selected by the range `start..=end` shifted by `offset`
+/// (all in % of the text length): 0 outside, a smooth ramp between the bounds, 1 inside. The
+/// bounds are ordered first, so a reversed range selects the same characters.
+pub fn range_factor(n: usize, i: usize, start: f32, end: f32, offset: f32) -> f32 {
+    if n == 0 || i >= n {
+        return 0.0;
+    }
+    let (mut lo, mut hi) = (start + offset, end + offset);
+    if lo > hi {
+        std::mem::swap(&mut lo, &mut hi);
+    }
+    let p = (i as f32 + 0.5) / n as f32 * 100.0;
+    if p <= lo {
+        return 0.0;
+    }
+    if p >= hi {
+        return 1.0;
+    }
+    let span = hi - lo;
+    if span <= f32::EPSILON {
+        return 1.0;
+    }
+    let u = (p - lo) / span;
+    u * u * (3.0 - 2.0 * u)
 }
 
 /// What a pinned layer follows.
@@ -589,5 +711,59 @@ mod tests {
         // no responsive time: plain clip time from design_in
         let plain = GraphicMeta { design_in: sec(1.0), ..Default::default() };
         assert_eq!(remap_time(&plain, sec(2.0), sec(3.0)), sec(3.0));
+    }
+
+    #[test]
+    fn range_factor_ramps_between_shifted_bounds() {
+        // 10 characters: character 0 sits at 5%, character 9 at 95%
+        // selection edges are exact: char 0 is out of a 10..=90% range, char 9 fully in
+        assert_eq!(range_factor(10, 0, 10.0, 90.0, 0.0), 0.0);
+        assert_eq!(range_factor(10, 9, 10.0, 90.0, 0.0), 1.0);
+        // a full 0..=100% range ramps at the edges instead of stepping
+        let f0 = range_factor(10, 0, 0.0, 100.0, 0.0);
+        assert!(f0 > 0.0 && f0 < 0.1, "{f0}");
+        let f9 = range_factor(10, 9, 0.0, 100.0, 0.0);
+        assert!(f9 > 0.9 && f9 < 1.0, "{f9}");
+        // second half selected: char 2 (25%) out, char 9 (95%) fully in (past the end
+        // stays selected, which is what grows a typewriter reveal as End animates)
+        assert_eq!(range_factor(10, 2, 50.0, 90.0, 0.0), 0.0);
+        assert_eq!(range_factor(10, 9, 50.0, 90.0, 0.0), 1.0);
+        // middle ramps: char 4 at 45% of a 30..=60% range
+        let f = range_factor(10, 4, 30.0, 60.0, 0.0);
+        assert!(f > 0.0 && f < 1.0, "{f}");
+        // offset shifts the whole range: 0..=30% + 60% selects the end
+        assert_eq!(range_factor(10, 2, 0.0, 30.0, 60.0), 0.0);
+        assert_eq!(range_factor(10, 9, 0.0, 30.0, 60.0), 1.0);
+        // a reversed range selects the same characters
+        assert_eq!(range_factor(10, 5, 50.0, 0.0, 0.0), range_factor(10, 5, 0.0, 50.0, 0.0));
+        // degenerate and hostile inputs never divide by zero or index out of range
+        assert_eq!(range_factor(0, 0, 0.0, 100.0, 0.0), 0.0);
+        assert_eq!(range_factor(10, 10, 0.0, 100.0, 0.0), 0.0);
+        assert_eq!(range_factor(10, 999, 0.0, 100.0, 0.0), 0.0);
+        assert_eq!(range_factor(10, 5, 40.0, 40.0, 0.0), 1.0);
+        assert_eq!(range_factor(10, 2, 40.0, 40.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn animators_evaluate_and_report_activity() {
+        use crate::keyframe::ParamValue;
+        let mut a = TextAnimator::new("Fade".into());
+        // defaults: opaque, no offset, whole range — inactive
+        assert!(!a.is_active());
+        let e = a.evaluate(Tick::ZERO);
+        assert_eq!((e.opacity, e.dx, e.dy, e.start, e.end, e.offset), (100.0, 0.0, 0.0, 0.0, 100.0, 0.0));
+        // a static fade activates it
+        a.opacity = Param::new(ParamValue::Float(0.0));
+        assert!(a.is_active());
+        assert_eq!(a.evaluate(Tick::ZERO).opacity, 0.0);
+        // keyframes animate: half fade at the midpoint
+        a.opacity.put_keyframe(Tick::ZERO, ParamValue::Float(0.0));
+        a.opacity.put_keyframe(sec(2.0), ParamValue::Float(100.0));
+        assert_eq!(a.evaluate(sec(1.0)).opacity, 50.0);
+        // serde round trip keeps keyframes (schema-compat: old files load empty)
+        let back: TextAnimator = serde_json::from_str(&serde_json::to_string(&a).unwrap()).unwrap();
+        assert_eq!(back, a);
+        let extra: LayerExtra = serde_json::from_str("{}").unwrap();
+        assert!(extra.animators.is_empty() && extra.is_empty());
     }
 }

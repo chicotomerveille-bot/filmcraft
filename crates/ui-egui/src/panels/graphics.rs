@@ -169,10 +169,53 @@ enum DragKind {
     Anchor,
     /// Corner-radius handle `n` of a rectangle (see [`corner_handles`]).
     Corner(usize),
+    /// Outside the box, near its edges: rotates the layer about its anchor point, as the
+    /// Motion box does (see `transform_handles`).
+    Rotate {
+        /// The pointer's angle about the anchor point at the previous frame.
+        angle: f64,
+        /// The accumulated turn so far, in degrees (a drag can go round more than once).
+        turned: f64,
+    },
     NewShape,
     /// The Type tool dragging out the box of a new paragraph-text layer.
     NewTextBox,
     TextSelect,
+}
+
+/// How far outside a layer's box (from its edges) the pointer rotates the layer.
+const ROTATE_REACH: f32 = 24.0;
+
+/// The distance from `p` to the segment `a`–`b`.
+fn seg_dist(p: Pos2, a: Pos2, b: Pos2) -> f32 {
+    let ab = b - a;
+    let l2 = ab.length_sq();
+    let t = if l2 > 0.0 { ((p - a).dot(ab) / l2).clamp(0.0, 1.0) } else { 0.0 };
+    (p - (a + ab * t)).length()
+}
+
+/// Whether `p` rotates the layer: outside its box but near one of its edges.
+fn rotate_zone(v: &LayerView, p: Pos2) -> bool {
+    if v.hit(p) {
+        return false;
+    }
+    let q = v.quad();
+    (0..4).any(|i| seg_dist(p, q[i], q[(i + 1) % 4]) <= ROTATE_REACH)
+}
+
+fn angle_deg(v: egui::Vec2) -> f64 {
+    f64::from(v.y.atan2(v.x).to_degrees())
+}
+
+/// The layer's box corners turned `deg` degrees about `a`.
+fn rotated_quad(q: &[Pos2; 4], a: Pos2, deg: f64) -> Vec<Pos2> {
+    let (s, c) = (deg.to_radians().sin(), deg.to_radians().cos());
+    q.iter()
+        .map(|p| {
+            let (dx, dy) = (f64::from(p.x - a.x), f64::from(p.y - a.y));
+            pos2((a.x as f64 + dx * c - dy * s) as f32, (a.y as f64 + dx * s + dy * c) as f32)
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -516,8 +559,70 @@ pub(crate) fn deselect_on_monitor(app: &mut FilmcraftApp, ui: &egui::Ui) {
     }
 }
 
+/// The spatial motion path of a layer's animated Position: screen points sampled across the
+/// clip plus its keyframe positions, so a move reads as a trajectory on the monitor (Effect
+/// Controls #448). The clip's own Motion is re-evaluated per sample, so the path follows it.
+fn position_path(app: &FilmcraftApp, pic: Rect, frame: (u32, u32), clip: ClipId, layer_no: usize) -> Option<(Vec<Pos2>, Vec<Pos2>)> {
+    let seq = app.session.active_sequence()?;
+    let (_, it) = seq.find_item(clip)?;
+    let ei = graphic::layer_indices(&it.effects).get(layer_no).copied()?;
+    let e = it.effects.get(ei)?;
+    let pos = e.params.get("position")?;
+    if !pos.is_animated() {
+        return None;
+    }
+    let (gw, gh) = app.session.project.item(it.item).and_then(|p| match p.kind {
+        ItemKind::Graphic { width, height, .. } => Some((width, height)),
+        _ => None,
+    })?;
+    let screen = frame_to_screen(pic, frame);
+    let at = |mt: Tick| {
+        let mut p = pos.vec2_at(mt);
+        if p.x.is_nan() || p.y.is_nan() {
+            p = Vec2::new(f64::from(gw) / 2.0, f64::from(gh) / 2.0);
+        }
+        let m = screen.then_apply(&filmcraft_render::motion_matrix(seq, it, (gw, gh), None, mt));
+        let q = m.apply(p);
+        pos2(q.x as f32, q.y as f32)
+    };
+    let mut pts = Vec::with_capacity(65);
+    for i in 0..=64 {
+        let mt = it.source_in + Tick((it.duration.0 as f64 * i as f64 / 64.0).round() as i64);
+        pts.push(at(mt));
+    }
+    let keys = pos.keyframes.iter().map(|k| at(k.time)).collect();
+    Some((pts, keys))
+}
+
+/// Spatial paths of the selected graphic layers' animated Positions, with keyframe dots and
+/// the playhead's dot. Read-only for now: edit the move in Effect Controls or by dragging
+/// the layer (see `docs/graphics.md`).
+fn draw_position_paths(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, frame: (u32, u32)) {
+    let t = app.tokens;
+    let sel_clip = selected_graphic(app).map(|(c, _)| c);
+    let sel_layers = app.session.state.graphic_layers.clone();
+    let painter = ui.painter().with_clip_rect(pic.expand(12.0));
+    for layer_no in sel_layers {
+        let Some(clip) = sel_clip else { break };
+        let Some((pts, keys)) = position_path(app, pic, frame, clip, layer_no) else { continue };
+        if pts.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
+            continue;
+        }
+        painter.add(egui::Shape::line(pts.clone(), Stroke::new(1.0, t.text_dim)));
+        for k in &keys {
+            painter.circle_filled(*k, 3.0, t.panel_bg);
+            painter.circle_stroke(*k, 3.0, Stroke::new(1.0, t.text_dim));
+        }
+        if let Some(last) = pts.last() {
+            painter.circle_filled(*last, 3.0, t.accent);
+        }
+        app.auto.add(&format!("program.layer.{}.{}.path", clip.0, layer_no), Rect::from_points(&pts), "motion path");
+    }
+}
+
 /// Draw the overlay and handle graphics tools on the Program monitor picture `pic`.
 pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, frame: (u32, u32)) {
+    draw_position_paths(app, ui, pic, frame);
     let t = app.tokens;
     let views = visible_layers(app, pic, frame);
     let tool = app.ui.tool;
@@ -578,6 +683,17 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
                 painter.line_segment([a - vec2(6.0, 0.0), a + vec2(6.0, 0.0)], Stroke::new(1.0, accent));
                 painter.line_segment([a - vec2(0.0, 6.0), a + vec2(0.0, 6.0)], Stroke::new(1.0, accent));
                 app.auto.add(&format!("program.layer.{}.{}.anchor", v.clip.0, v.layer), Rect::from_center_size(a, vec2(12.0, 12.0)), "anchor point");
+                // rotate zones, just outside the corners away from the box's centre, as Motion's
+                let mid = q.iter().fold(pos2(0.0, 0.0), |s, p| pos2(s.x + p.x / 4.0, s.y + p.y / 4.0));
+                for (n, c) in q.iter().enumerate() {
+                    let out = (*c - mid).normalized();
+                    let out = if out.is_finite() { out } else { vec2(0.0, -1.0) };
+                    app.auto.add(
+                        &format!("program.layer.{}.{}.rotate.{n}", v.clip.0, v.layer),
+                        Rect::from_center_size(*c + out * 14.0, vec2(10.0, 10.0)),
+                        "rotate",
+                    );
+                }
             }
         }
     }
@@ -603,6 +719,11 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
                 } else if let Some(n) = corner {
                     // along the corner's diagonal, the way the drag works
                     ui.ctx().set_cursor_icon(if n % 2 == 0 { egui::CursorIcon::ResizeNwSe } else { egui::CursorIcon::ResizeNeSw });
+                } else if let Some(v) = views.iter().filter(|v| Some(v.clip) == sel_clip && sel_layers.contains(&v.layer)).find(|v| rotate_zone(v, p)) {
+                    let out = (p - anchor_screen(v)).normalized();
+                    let out = if out.is_finite() { out } else { vec2(0.0, -1.0) };
+                    crate::panels::transform_handles::rotate_pointer(&ui.painter().with_clip_rect(pic.expand(40.0)), p, out);
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::None);
                 } else if views.iter().any(|v| v.hit(p)) {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
                 }
@@ -657,6 +778,11 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
                         drag = Some(DragState { kind: DragKind::Handle(n), clip: c, layer: l, start: p });
                     } else if let Some((c, l, n)) = corner {
                         drag = Some(DragState { kind: DragKind::Corner(n), clip: c, layer: l, start: p });
+                    } else if tool == Tool::Selection
+                        && let Some(v) = selected().find(|v| rotate_zone(v, p))
+                    {
+                        let a = anchor_screen(v);
+                        drag = Some(DragState { kind: DragKind::Rotate { angle: angle_deg(p - a), turned: 0.0 }, clip: v.clip, layer: v.layer, start: p });
                     } else if tool == Tool::Type && !views.iter().any(|v| v.is_text() && v.hit(p)) {
                         drag = Some(DragState { kind: DragKind::NewTextBox, clip: ClipId(0), layer: 0, start: p });
                     } else if tool == Tool::Selection
@@ -729,6 +855,24 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
                     }
                 }
             }
+            DragKind::Rotate { angle, turned } => {
+                if let Some(v) = v {
+                    let a = anchor_screen(v);
+                    let mut st = (angle, turned);
+                    if (cur - a).length() >= 1.0 {
+                        let an = angle_deg(cur - a);
+                        st.1 += (an - st.0 + 180.0).rem_euclid(360.0) - 180.0;
+                        st.0 = an;
+                        ui.data_mut(|dd| {
+                            if let Some(drag) = dd.get_temp::<DragState>(drag_id) {
+                                dd.insert_temp(drag_id, DragState { kind: DragKind::Rotate { angle: st.0, turned: st.1 }, ..drag });
+                            }
+                        });
+                    }
+                    painter.add(egui::Shape::closed_line(rotated_quad(&v.quad(), a, st.1), Stroke::new(1.0, Color32::WHITE)));
+                    painter.line_segment([a, cur], Stroke::new(1.0, Color32::WHITE));
+                }
+            }
             DragKind::NewTextBox => {
                 painter.rect_stroke(Rect::from_two_pos(d.start, cur), 0.0, Stroke::new(1.0, t.danger), StrokeKind::Middle);
             }
@@ -792,6 +936,17 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
                     {
                         let r = corner_drag(v, r0, n, d.start, cur);
                         actions.push(("graphics.set".into(), json!({"clip": v.clip.0, "layer": v.layer, "props": {"corner_radius": r}})));
+                    }
+                }
+                DragKind::Rotate { turned, .. } if moved => {
+                    if let Some(v) = v {
+                        let rot = v.spec.transform.rotation + turned;
+                        if rot.is_finite() {
+                            actions.push((
+                                "graphics.set".into(),
+                                json!({"clip": v.clip.0, "layer": v.layer, "props": {"rotation": rot.clamp(-36_000.0, 36_000.0)}}),
+                            ));
+                        }
                     }
                 }
                 DragKind::NewTextBox if moved => {

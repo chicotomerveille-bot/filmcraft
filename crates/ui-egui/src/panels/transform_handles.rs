@@ -339,7 +339,7 @@ fn cursor(ui: &egui::Ui, pl: &Placement, grab: Grab, at: Pos2, pic: Rect) {
 
 /// Premiere's rotate pointer: a curved double arrow at `at`, bulging along `out` (away from the
 /// box), so it turns to face outward wherever the pointer is around the box.
-fn rotate_pointer(painter: &egui::Painter, at: Pos2, out: egui::Vec2) {
+pub(crate) fn rotate_pointer(painter: &egui::Painter, at: Pos2, out: egui::Vec2) {
     const R: f32 = 9.0;
     const SWEEP: f32 = 1.6;
     let c = at - out * R;
@@ -357,6 +357,50 @@ fn rotate_pointer(painter: &egui::Painter, at: Pos2, out: egui::Vec2) {
     for h in heads {
         painter.add(egui::Shape::convex_polygon(h, Color32::WHITE, Stroke::new(1.0, Color32::BLACK)));
     }
+}
+
+/// The spatial motion path of an animated Motion Position: the anchor point's screen
+/// positions sampled across the clip, with keyframe dots and the playhead's dot, so a move
+/// reads as a trajectory on the monitor (Effect Controls #448). Read-only for now: edit the
+/// move in Effect Controls or by dragging the picture.
+fn draw_motion_path(app: &mut FilmcraftApp, ui: &egui::Ui, pic: Rect, frame: (u32, u32), sel: Target) {
+    let t = app.tokens;
+    let Some(seq) = app.session.active_sequence() else { return };
+    let Some((_, it)) = seq.find_item(sel.0) else { return };
+    let Some(e) = it.effects.get(sel.1).filter(|e| e.effect == "motion") else { return };
+    let Some(pos) = e.params.get("position") else { return };
+    if !pos.is_animated() {
+        return;
+    }
+    let project = &app.session.project;
+    let size = filmcraft_render::source_size(project, it.item).unwrap_or(frame);
+    let par = filmcraft_render::source_par(project, it.item);
+    let view = frame_to_screen(pic, frame);
+    let centre = Vec2::new(f64::from(size.0) / 2.0, f64::from(size.1) / 2.0);
+    let at = |mt: Tick| {
+        let v = e.param("anchor").map_or(centre, |p| p.vec2_at(mt));
+        let anchor = Vec2::new(if v.x.is_nan() { centre.x } else { v.x }, if v.y.is_nan() { centre.y } else { v.y });
+        let q = view.then_apply(&filmcraft_render::motion_matrix(seq, it, size, par, mt)).apply(anchor);
+        pos2(q.x as f32, q.y as f32)
+    };
+    let mut pts = Vec::with_capacity(65);
+    for i in 0..=64 {
+        pts.push(at(it.source_in + Tick((it.duration.0 as f64 * i as f64 / 64.0).round() as i64)));
+    }
+    if pts.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
+        return;
+    }
+    let painter = ui.painter().with_clip_rect(pic.expand(12.0));
+    painter.add(egui::Shape::line(pts.clone(), Stroke::new(1.0, t.text_dim)));
+    for k in &pos.keyframes {
+        let p = at(k.time);
+        painter.circle_filled(p, 3.0, t.panel_bg);
+        painter.circle_stroke(p, 3.0, Stroke::new(1.0, t.text_dim));
+    }
+    if let Some(last) = pts.last() {
+        painter.circle_filled(*last, 3.0, t.accent);
+    }
+    app.auto.add("program.transform.path", Rect::from_points(&pts), "motion path");
 }
 
 /// The top-most clip at the playhead whose picture is under `p`.
@@ -384,6 +428,7 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
     let double = ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
     if let Some((sel, def, pl)) = selected_placement(app, pic, frame) {
         draw(app, ui, &pl, pic, def.name);
+        draw_motion_path(app, ui, pic, frame, sel);
         // (as far again beyond the rotate zone, where a click lets go of the box)
         let resp = ui.interact(Rect::from_points(&pl.quad).expand(ROTATE_REACH * 2.0), id, Sense::click_and_drag());
         // the left button only: a middle or right drag leaves the picture alone

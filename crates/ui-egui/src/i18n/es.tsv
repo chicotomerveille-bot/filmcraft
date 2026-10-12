@@ -3592,3 +3592,8 @@
 	Export the labels to a preset file…	Exportar las etiquetas a un archivo de ajuste preestablecido…
 	Show the presets folder	Mostrar la carpeta de ajustes preestablecidos
 	Delete this preset	Eliminar este ajuste preestablecido
+	Add Text Animator	Añadir animador de texto
+	Set Text Animator	Establecer animador de texto
+	Remove Text Animator	Quitar animador de texto
+	Toggle Text Animator Animation	Activar/desactivar la animación del animador de texto
+	Remove Text Animator Keyframe	Quitar fotograma clave del animador de texto

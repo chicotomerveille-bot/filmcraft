@@ -103,7 +103,7 @@ Timecode and Clip Name effects also draw with the text engine.
 | `graphics.selectNextLayer`, `graphics.selectPreviousLayer` | Select ▸ Select Next / Previous Layer (⌥⌘], ⌥⌘[) | cycles the selected layer |
 | `graphics.resetAllParameters` | Reset All Parameters | `layers` (default: the selected layers, else all) — appearance, text formatting and transform back to defaults; text, shape and geometry kept |
 | `graphics.resetDuration` | Reset Duration | `seconds` (5), limited by the next clip on the track |
-| `graphics.list` | (query) | `clip` — layers with names, kinds, text, `textType` (point / paragraph), `box`, `overflow` (the box hides text), position, anchor, scale and on-canvas quads |
+| `graphics.list` | (query) | `clip` — layers with names, kinds, text, `textType` (point / paragraph), `box`, `overflow` (the box hides text), position, anchor, scale and on-canvas quads, `rotation`, `opacity` (%), `animators` (names) |
 | `fonts.list` | (query) | `system` (scan system font folders, default true) — families and styles |
 
 Without `clip`, commands use the selected graphic clip, else the topmost graphic clip under the
@@ -116,7 +116,7 @@ duration (a track is added if needed).
 | Tool | On the Program monitor |
 |---|---|
 | Type (T) | Click empty picture: new point-text layer with a caret. Drag on empty picture: new paragraph-text layer with that box. Click a text layer: caret there. The box of the text being typed into is red. Type; ←/→ (⌥ word, ⌘ line), ↑/↓, Home/End, Shift to select, ⌘A, ⌘C/⌘X/⌘V, Return = new line, Backspace/Delete, Esc = stop editing. Drag inside the edited text to select. |
-| Selection (V) | Click a layer to select it (box with handles and anchor point; only selected layers have a box, and a layer whose visibility is off has none and cannot be clicked); drag to move; drag the anchor point to move it alone; drag a handle to scale point text about its anchor, resize a paragraph-text box (see *Point text and paragraph text*), or change a shape's Size: the dragged side or corner follows the pointer while the opposite one and the anchor point stay, Scale is untouched, and Shift on a corner keeps the proportions (a path, which has no Size, stretches instead); double-click a text layer to edit it with all its text selected, so typing replaces it; while text is edited, Select All (Cmd/Ctrl+A or Edit ▸ Select All) selects all of that text instead of the timeline clips. |
+| Selection (V) | Click a layer to select it (box with handles and anchor point; only selected layers have a box, and a layer whose visibility is off has none and cannot be clicked); drag to move; drag the anchor point to move it alone; drag a handle to scale point text about its anchor, resize a paragraph-text box (see *Point text and paragraph text*), or change a shape's Size: the dragged side or corner follows the pointer while the opposite one and the anchor point stay, Scale is untouched, and Shift on a corner keeps the proportions (a path, which has no Size, stretches instead); drag just outside the box to rotate the layer about its anchor point (keyframe-aware through `rotation`); double-click a text layer to edit it with all its text selected, so typing replaces it; while text is edited, Select All (Cmd/Ctrl+A or Edit ▸ Select All) selects all of that text instead of the timeline clips. |
 | Rectangle / Ellipse | Drag to draw a shape layer. |
 | Pen (P) | Click to place points; click the first point (or Return) to close the path; Esc cancels. |
 
@@ -124,9 +124,15 @@ Moving a layer snaps its edges or centre to the frame edges, the frame centre an
 (View ▸ Snap in Program Monitor, on by default; hold ⌘/Ctrl to move freely). See
 [monitors.md](monitors.md) for rulers and guides.
 
+An animated Position (a graphic layer's, or a clip's Motion) draws its spatial path on the
+monitor: the trajectory sampled across the clip with keyframe dots and the playhead's dot.
+Read-only for now: retime the move in Effect Controls, or drag the layer (which keys the
+playhead when the stopwatch is on).
+
 Automation ids: `program.layer.<clip>.<layer>`, `program.layer.<clip>.<layer>.handle.<n>`
 (0–3 the corners from the top-left clockwise, 4–7 the top, right, bottom and left sides),
-`program.layer.<clip>.<layer>.anchor`,
+`program.layer.<clip>.<layer>.anchor`, `program.layer.<clip>.<layer>.rotate.<n>` (just outside
+each corner), `program.layer.<clip>.<layer>.path` (the spatial path),
 `program.textEdit` (while editing).
 
 ## Properties / Essential Graphics panels
@@ -157,6 +163,35 @@ lines grow to fit the largest run, and each run can have its own fill colour.
 | Command | Params |
 |---|---|
 | `graphics.setCharStyle` | `clip`, `layer`, `start`, `end` (characters; default the whole text), `style` {`font`, `fontStyle`, `size`, `color`, `bold`, `italic`, `underline`, `tracking`, `baselineShift`, `caps`}, `clear` (remove styles from the range) |
+
+## Text animators
+
+A text layer holds any number of **animators** (Premiere-style): each sets an opacity and a
+positional offset applied per character through a **range selector** (`start` / `end` / `offset`
+in % of the text length, shifted by the offset, ramping smoothly between the bounds; characters
+past the end stay selected, which is what grows a typewriter reveal as End animates 0→100).
+Every scalar is keyframable with the project's usual interpolation; several animators combine
+in list order (opacities multiply, offsets add). A typewriter base is one call:
+`graphics.addAnimator {"opacity": 0}` (full range), then keyframe `end`.
+
+Animators live on the layer (`EffectInstance::layer.animators`, `filmcraft_project::graphic_design`;
+old files load with none) and evaluate in `eval_layer` into the `LayerSpec`. The renderer draws
+affected glyphs with per-glyph offset and coverage (`graphic_clip::draw_animated`), so animated
+glyphs keep their fills (including per-character fills), strokes and shadow; underlines and the
+background box stay whole. Rotated layers take a slower per-glyph outline path while an animator
+is active. Effect Controls shows one section per animator (stopwatch, editors, keyframe
+navigator); the keyframe lane and value graphs stay effect parameters only for now.
+
+| Command | Params |
+|---|---|
+| `graphics.addAnimator` | `clip`, `layer`, `name`, initial `opacity` (%) / `x` / `y` (px) / `start` / `end` / `offset` (%) — one undo step |
+| `graphics.setAnimator` | `clip`, `layer`, `animator` (default the first), any of the six values, `keyframe` (force a keyframe), `time`, `merge` + `begin` (a drag is one undo step) |
+| `graphics.removeAnimator` | `clip`, `layer`, `animator` |
+| `graphics.toggleAnimator` | `clip`, `layer`, `animator`, `field` (one of the six, default `opacity`) — the stopwatch |
+| `graphics.removeAnimatorKeyframe` | `clip`, `layer`, `animator`, `field` — the keyframe at the playhead, or an error |
+
+Automation ids: `effectControls.graphic_text.animator.add`, `.animator.<n>.remove`,
+`.animator.<n>.<field>.stopwatch|.addKeyframe|.prevKeyframe|.nextKeyframe`.
 
 ## Responsive design
 
@@ -261,4 +296,7 @@ solid fill colour.
 ## Not yet
 
 Mask-with-text, per-layer blend modes, Bézier curves in the pen tool (paths are polygons), media
-layers inside graphics, and template controls grouped into folders.
+layers inside graphics, template controls grouped into folders, keyframe lane diamonds and value
+graphs for text animators (their rows stopwatch, edit and navigate), draggable spatial paths,
+per-character rotation / scale / tracking animators, animator presets beyond one-call recipes,
+and the Wiggly selector.

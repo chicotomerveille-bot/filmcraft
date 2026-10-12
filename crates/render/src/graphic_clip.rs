@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use filmcraft_geom::{Affine, Vec2};
 use filmcraft_project::graphic::{LayerContent, LayerSpec, LinearGradient, ShapeProps, TextProps, eval_layer};
-use filmcraft_project::graphic_design::{GraphicMeta, PinNode, remap_time, resolve_pins, roll_offset};
+use filmcraft_project::graphic_design::{EvaluatedAnimator, GraphicMeta, PinNode, remap_time, resolve_pins, roll_offset};
 use filmcraft_project::{EffectInstance, TrackItem};
-use filmcraft_text::raster::{Xform, apply, fill_into, xform_scale};
+use filmcraft_text::raster::{Xform, apply, compose, fill, fill_into, xform_scale};
 use filmcraft_text::{Align, Caps, Layout, Mask, ParagraphStyle, StrokeKind, StyleRun, TextStyle, layout_rich, mask, render};
 use filmcraft_time::Tick;
 use rayon::prelude::*;
@@ -235,8 +235,19 @@ fn over_linear_gradient(px: &mut [f32], msk: &Mask, grad: &LinearGradient, lb: [
     });
 }
 
-/// Solid fill, one mask per distinct colour when text runs carry their own.
-fn paint_solid(px: &mut [f32], cover: &Mask, color: [f32; 4], text: Option<&Layout>, m: &Xform, run_fills: &[Option<[f32; 4]>], origin: (i32, i32)) {
+/// Solid fill, one mask per distinct colour when text runs carry their own. While text
+/// animators are active the run masks are drawn animated too, so moved glyphs keep their
+/// run colours.
+fn paint_solid(
+    px: &mut [f32],
+    cover: &Mask,
+    color: [f32; 4],
+    text: Option<&Layout>,
+    m: &Xform,
+    run_fills: &[Option<[f32; 4]>],
+    origin: (i32, i32),
+    anim: Option<&[GlyphDelta]>,
+) {
     let Some(layout) = text.filter(|_| run_fills.iter().any(Option::is_some)) else {
         over_mask(px, cover, premul_linear(color));
         return;
@@ -252,13 +263,17 @@ fn paint_solid(px: &mut [f32], cover: &Mask, color: [f32; 4], text: Option<&Layo
     for (col, runs) in groups {
         let mut m_run = Mask::new(cover.w, cover.h);
         for r in runs {
-            render::draw_run(layout, m, &mut m_run, origin, Some(r));
+            match anim {
+                Some(d) => draw_animated(layout, m, &mut m_run, origin, d, Some(r)),
+                None => render::draw_run(layout, m, &mut m_run, origin, Some(r)),
+            }
         }
         over_mask(px, &m_run, premul_linear(col));
     }
 }
 
 /// Gradient for runs that have no fill of their own; runs with a fill stay that solid colour.
+/// While text animators are active the run masks are drawn animated too.
 fn paint_mixed_gradient(
     px: &mut [f32],
     cover: &Mask,
@@ -269,9 +284,13 @@ fn paint_mixed_gradient(
     layout: &Layout,
     m: &Xform,
     run_fills: &[Option<[f32; 4]>],
+    anim: Option<&[GlyphDelta]>,
 ) {
     let mut grad_mask = Mask::new(cover.w, cover.h);
-    render::draw_run(layout, m, &mut grad_mask, origin, Some(0));
+    match anim {
+        Some(d) => draw_animated(layout, m, &mut grad_mask, origin, d, Some(0)),
+        None => render::draw_run(layout, m, &mut grad_mask, origin, Some(0)),
+    }
     let mut solids: Vec<([f32; 4], Vec<u16>)> = Vec::new();
     for (i, fill) in run_fills.iter().enumerate() {
         let run = (i + 1) as u16;
@@ -281,16 +300,151 @@ fn paint_mixed_gradient(
                 None => solids.push((*col, vec![run])),
             }
         } else {
-            render::draw_run(layout, m, &mut grad_mask, origin, Some(run));
+            match anim {
+                Some(d) => draw_animated(layout, m, &mut grad_mask, origin, d, Some(run)),
+                None => render::draw_run(layout, m, &mut grad_mask, origin, Some(run)),
+            }
         }
     }
     over_linear_gradient(px, &grad_mask, grad, lb, inv, origin);
     for (col, runs) in solids {
         let mut m_run = Mask::new(cover.w, cover.h);
         for r in runs {
-            render::draw_run(layout, m, &mut m_run, origin, Some(r));
+            match anim {
+                Some(d) => draw_animated(layout, m, &mut m_run, origin, d, Some(r)),
+                None => render::draw_run(layout, m, &mut m_run, origin, Some(r)),
+            }
         }
         over_mask(px, &m_run, premul_linear(col));
+    }
+}
+
+/// Per-glyph offset and opacity multiplier from a text layer's animators.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GlyphDelta {
+    /// Offset in layer px.
+    pub dx: f32,
+    pub dy: f32,
+    /// Coverage multiplier 0..1.
+    pub alpha: f32,
+}
+
+/// Per-glyph animator state for a laid-out text: `None` when no animator changes the raster.
+/// Opacities multiply and offsets add in animator order; underlines and the background box
+/// stay whole (see `docs/graphics.md`). Character positions are the glyph clusters' character
+/// indices (`(i + 0.5) / n` of the text length, like the style runs).
+pub fn animator_deltas(text: &str, layout: &Layout, animators: &[EvaluatedAnimator]) -> Option<Vec<GlyphDelta>> {
+    use filmcraft_project::graphic_design::range_factor;
+    if animators.is_empty() || layout.glyphs.is_empty() {
+        return None;
+    }
+    let n = text.chars().count();
+    if n == 0 {
+        return None;
+    }
+    // byte offset → character index (clusters point at character starts; anything else maps
+    // out of range, which selects nothing)
+    let mut byte_to_char = vec![n; text.len() + 1];
+    for (ci, (b, ch)) in text.char_indices().enumerate() {
+        for k in b..(b + ch.len_utf8()).min(text.len() + 1) {
+            byte_to_char[k] = ci;
+        }
+    }
+    let mut deltas = vec![GlyphDelta { dx: 0.0, dy: 0.0, alpha: 1.0 }; layout.glyphs.len()];
+    let mut any = false;
+    for a in animators {
+        let op = (a.opacity / 100.0).clamp(0.0, 1.0);
+        for (d, g) in deltas.iter_mut().zip(&layout.glyphs) {
+            let f = range_factor(n, byte_to_char[g.cluster.min(text.len())], a.start, a.end, a.offset);
+            if f > 0.0 {
+                d.dx += f * a.dx;
+                d.dy += f * a.dy;
+                d.alpha *= 1.0 - f * (1.0 - op);
+                any = true;
+            }
+        }
+    }
+    any.then_some(deltas)
+}
+
+/// Add `src` placed at (`ox`, `oy`) with coverage scaled by `k` (saturating at 1).
+fn add_scaled(out: &mut Mask, src: &Mask, ox: i32, oy: i32, k: f32) {
+    if k <= 0.0 || src.w == 0 || src.h == 0 {
+        return;
+    }
+    for y in 0..src.h {
+        let ty = oy + y as i32;
+        if ty < 0 || ty >= out.h as i32 {
+            continue;
+        }
+        let x0 = (-ox).max(0) as usize;
+        let x1 = src.w.min((out.w as i32 - ox).max(0) as usize);
+        if x0 >= x1 {
+            continue;
+        }
+        let srow = &src.a[y * src.w + x0..y * src.w + x1];
+        let d0 = ty as usize * out.w + (ox + x0 as i32) as usize;
+        for (d, s) in out.a[d0..d0 + (x1 - x0)].iter_mut().zip(srow) {
+            *d = (*d + s * k).min(1.0);
+        }
+    }
+}
+
+/// [`render::draw_run`] with a per-glyph offset and coverage multiplier (text animators),
+/// used instead of it while any animator changes the raster (`run` filters style runs like
+/// [`render::draw_run`]). Everything downstream (fills, strokes, shadow) reads the same `cover`
+/// mask, so animated glyphs keep their strokes and shadow; underlines stay whole. The rotated
+/// (non-axis-uniform) path rasterises each glyph through its outline; it is slower and only
+/// runs while an animator is active on a rotated layer.
+pub fn draw_animated(l: &Layout, m: &Xform, out: &mut Mask, origin: (i32, i32), deltas: &[GlyphDelta], run: Option<u16>) {
+    let (ox, oy) = origin;
+    let keep = |r: u16| run.is_none_or(|x| x == r);
+    if render::is_axis_uniform(m) {
+        let s = m[0];
+        for (g, d) in l.glyphs.iter().zip(deltas) {
+            if !keep(g.run) || d.alpha <= 0.0 {
+                continue;
+            }
+            let (x, y) = apply(m, g.x + d.dx, g.y + d.dy);
+            let px = g.size * s;
+            if px < 0.5 {
+                continue;
+            }
+            let xi = x.floor();
+            if let Some(gm) = render::glyph_mask(g, px, x - xi) {
+                let (dx, dy) = (xi as i32 + gm.left - ox, y.round() as i32 + gm.top - oy);
+                if d.alpha >= 1.0 {
+                    out.add(&gm.mask, dx, dy);
+                } else {
+                    add_scaled(out, &gm.mask, dx, dy, d.alpha);
+                }
+            }
+        }
+    } else {
+        for (g, d) in l.glyphs.iter().zip(deltas) {
+            if !keep(g.run) || d.alpha <= 0.0 {
+                continue;
+            }
+            let gm = compose(m, &[1.0, 0.0, 0.0, 1.0, g.x + d.dx, g.y + d.dy]);
+            let p = render::glyph_path(g, &gm);
+            if d.alpha >= 1.0 {
+                fill_into(&p, out, -ox as f32, -oy as f32);
+            } else {
+                let t = fill(&p, out.w, out.h, -ox as f32, -oy as f32);
+                add_scaled(out, &t, 0, 0, d.alpha);
+            }
+        }
+    }
+    if !l.underlines.is_empty() {
+        let mut p = filmcraft_text::Path::new();
+        for (i, u) in l.underlines.iter().enumerate() {
+            if keep(l.underline_runs.get(i).copied().unwrap_or(0)) {
+                p.extend(&filmcraft_text::Path::rect(u[0], u[1], u[2], u[3]).transformed(m));
+            }
+        }
+        if !p.is_empty() {
+            fill_into(&p, out, -ox as f32, -oy as f32);
+        }
     }
 }
 
@@ -333,7 +487,13 @@ pub fn raster_layer(spec: &LayerSpec, m: &Xform, cw: usize, ch: usize) -> Option
         })
         .fold(0.0f32, f32::max);
     let overhang = text.as_ref().map_or(0.0, |l| l.glyphs.iter().map(|g| g.size).fold(0.0f32, f32::max) * 0.35);
-    let mut bb = bbox_of(m, lb, overhang + stroke_out + 2.0 / s);
+    // text animators: per-glyph deltas, and room for their offsets in the layer box
+    let anim = match (&spec.content, &text) {
+        (LayerContent::Text(t), Some(l)) if !spec.animators.is_empty() => animator_deltas(&t.text, l, &spec.animators),
+        _ => None,
+    };
+    let anim_pad = anim.as_ref().map_or(0.0, |d| d.iter().map(|g| g.dx.abs().max(g.dy.abs())).fold(0.0f32, f32::max));
+    let mut bb = bbox_of(m, lb, overhang + stroke_out + anim_pad + 2.0 / s);
     if let Some((_, pad, _)) = ap.background {
         bb = union(bb, bbox_of(m, lb, pad + 1.0 / s));
     }
@@ -359,7 +519,10 @@ pub fn raster_layer(spec: &LayerSpec, m: &Xform, cw: usize, ch: usize) -> Option
     }
     let mut cover = Mask::new(w, h);
     if let Some(l) = &text {
-        render::draw(l, m, &mut cover, (x0, y0));
+        match &anim {
+            Some(d) => draw_animated(l, m, &mut cover, (x0, y0), d, None),
+            None => render::draw(l, m, &mut cover, (x0, y0)),
+        }
     }
     if let Some(p) = &shape {
         fill_into(p, &mut cover, -x0 as f32, -y0 as f32);
@@ -407,12 +570,12 @@ pub fn raster_layer(spec: &LayerSpec, m: &Xform, cw: usize, ch: usize) -> Option
         if run_fills.iter().any(Option::is_some)
             && let Some(layout) = &text
         {
-            paint_mixed_gradient(&mut px, &cover, grad, lb, &inv, (x0, y0), layout, m, &run_fills);
+            paint_mixed_gradient(&mut px, &cover, grad, lb, &inv, (x0, y0), layout, m, &run_fills, anim.as_deref());
         } else {
             over_linear_gradient(&mut px, &cover, grad, lb, &inv, (x0, y0));
         }
     } else if let Some(c) = ap.fill {
-        paint_solid(&mut px, &cover, c, text.as_deref(), m, &run_fills, (x0, y0));
+        paint_solid(&mut px, &cover, c, text.as_deref(), m, &run_fills, (x0, y0), anim.as_deref());
     }
     for ((sm, c), (_, _, k)) in strokes.iter().zip(&ap.strokes).rev() {
         if !outer(*k) {
@@ -947,5 +1110,126 @@ mod tests {
                 assert!((p[3] - q[3]).abs() < 1e-5);
             }
         }
+    }
+
+    /// Ink (summed alpha) left and right of device x `split`.
+    fn ink_sides(img: &Image, split: f32) -> (f64, f64) {
+        let (mut left, mut right) = (0.0, 0.0);
+        for y in 0..img.h {
+            for x in 0..img.w {
+                let a = img.get(x, y)[3] as f64;
+                if (x as f32) < split {
+                    left += a;
+                } else {
+                    right += a;
+                }
+            }
+        }
+        (left, right)
+    }
+
+    fn faded_second_half() -> EffectInstance {
+        use filmcraft_project::graphic_design::{LayerExtra, TextAnimator};
+        use filmcraft_project::keyframe::{Param, ParamValue};
+        let mut e = new_text_layer("AAAA", Vec2::new(20.0, 100.0), 60.0);
+        set(&mut e, "fill_color", ParamValue::Color([1.0, 1.0, 1.0, 1.0]));
+        let mut a = TextAnimator::new("Fade".into());
+        a.opacity = Param::new(ParamValue::Float(0.0));
+        a.range.start = Param::new(ParamValue::Float(50.0));
+        a.range.end = Param::new(ParamValue::Float(100.0));
+        e.layer = Some(Box::new(LayerExtra { animators: vec![a], ..Default::default() }));
+        e
+    }
+
+    #[test]
+    fn animator_opacity_fades_selected_characters() {
+        let e = faded_second_half();
+        let mut img = Image::new(400, 200);
+        render_graphic_layers(std::slice::from_ref(&e), Tick::ZERO, (400, 200), &Affine::IDENTITY, &mut img);
+        let l = text_layout(match &eval_layer(&e, Tick::ZERO, (400, 200)).unwrap().content {
+            LayerContent::Text(t) => t,
+            _ => unreachable!(),
+        });
+        // device x of the boundary between characters 1 and 2 (position 20 + layout x)
+        let split = 20.0 + l.caret(2).0;
+        let (left, right) = ink_sides(&img, split);
+        assert!(left > 100.0 && right > 100.0, "both halves have ink: {left} {right}");
+        // chars 2-3 fade to 0 while chars 0-1 stay: the left half outweighs the right
+        assert!(left > 2.0 * right, "full left {left} vs faded right {right}");
+        // without the animator the halves balance (same letter four times)
+        let mut plain = e.clone();
+        plain.layer.as_mut().unwrap().animators.clear();
+        let mut img2 = Image::new(400, 200);
+        render_graphic_layers(&[plain], Tick::ZERO, (400, 200), &Affine::IDENTITY, &mut img2);
+        let (l2, r2) = ink_sides(&img2, split);
+        assert!((l2 - r2).abs() / l2.max(r2) < 0.15, "balanced without animator: {l2} {r2}");
+    }
+
+    #[test]
+    fn animator_offset_moves_selected_characters() {
+        use filmcraft_project::graphic_design::{LayerExtra, TextAnimator};
+        use filmcraft_project::keyframe::{Param, ParamValue};
+        let mut e = new_text_layer("AAAA", Vec2::new(20.0, 100.0), 60.0);
+        set(&mut e, "fill_color", ParamValue::Color([1.0, 1.0, 1.0, 1.0]));
+        let still = {
+            let mut img = Image::new(400, 200);
+            render_graphic_layers(std::slice::from_ref(&e), Tick::ZERO, (400, 200), &Affine::IDENTITY, &mut img);
+            ink_box(&img).unwrap()
+        };
+        let mut a = TextAnimator::new("Slide".into());
+        a.x = Param::new(ParamValue::Float(40.0));
+        a.range.start = Param::new(ParamValue::Float(50.0));
+        a.range.end = Param::new(ParamValue::Float(100.0));
+        e.layer = Some(Box::new(LayerExtra { animators: vec![a], ..Default::default() }));
+        let mut img = Image::new(400, 200);
+        render_graphic_layers(&[e], Tick::ZERO, (400, 200), &Affine::IDENTITY, &mut img);
+        let moved = ink_box(&img).unwrap();
+        // the last letter (87.5% in the range) moves ~+34 px; the first letters stay
+        assert!(moved[2] >= still[2] + 20, "right edge moved right: {still:?} {moved:?}");
+        assert!(moved[0].abs_diff(still[0]) <= 1, "left edge stayed: {still:?} {moved:?}");
+    }
+
+    #[test]
+    fn animator_keyframes_evaluate_through_the_layer() {
+        use filmcraft_project::graphic_design::{LayerExtra, TextAnimator};
+        use filmcraft_project::keyframe::ParamValue;
+        let mut e = new_text_layer("Hi", Vec2::new(20.0, 100.0), 60.0);
+        let mut a = TextAnimator::new("Fade".into());
+        a.opacity.put_keyframe(Tick::ZERO, ParamValue::Float(0.0));
+        a.opacity.put_keyframe(Tick::from_seconds_f64(2.0), ParamValue::Float(100.0));
+        e.layer = Some(Box::new(LayerExtra { animators: vec![a], ..Default::default() }));
+        for (s, want) in [(0.0, 0.0), (1.0, 50.0), (2.0, 100.0)] {
+            let spec = eval_layer(&e, Tick::from_seconds_f64(s), (400, 200)).unwrap();
+            assert_eq!(spec.animators.len(), 1);
+            assert!((spec.animators[0].opacity - want).abs() < 1e-6, "{s}: {:?}", spec.animators[0]);
+        }
+        // multibyte text maps clusters to characters without panicking
+        let l = text_layout(&filmcraft_project::graphic::TextProps {
+            text: "héllo wörld".into(),
+            font: String::new(),
+            style: String::new(),
+            size: 40.0,
+            align: 0,
+            tracking: 0.0,
+            kerning: true,
+            ligatures: true,
+            leading: 0.0,
+            baseline_shift: 0.0,
+            faux_bold: false,
+            faux_italic: false,
+            caps: 0,
+            underline: false,
+            box_width: 0.0,
+            box_height: 0.0,
+            vertical: false,
+            runs: Vec::new(),
+        });
+        let d = animator_deltas(
+            "héllo wörld",
+            &l,
+            &[filmcraft_project::graphic_design::EvaluatedAnimator { opacity: 0.0, dx: 0.0, dy: 0.0, start: 0.0, end: 100.0, offset: 0.0 }],
+        )
+        .unwrap();
+        assert_eq!(d.len(), l.glyphs.len());
     }
 }
